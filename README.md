@@ -1,2 +1,2 @@
-# channel-bm
+# brownpy
  Brownian motion through channel
