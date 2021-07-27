@@ -268,14 +268,19 @@ class Universe():
     # Get number of particles
     N = self.N
     # Surface of reservoirs
-    S_R = R**2
+    S_R = np.pi*R**2
     # Surface of the channel
     S_c = h*L
 
     # Put particles in reservoirs
     N_R = int(np.ceil(N*S_R/(S_R+S_c)))
     r0_R = np.random.uniform(-R, R, size=(N_R, 2))
-
+    index_outside = np.where((np.linalg.norm(r0_R, axis=1, ord=2) > R) +
+                              (np.linalg.norm(r0_R, axis=1, ord=2) < 10000))
+    while(len(index_outside[0]) != 0):
+      r0_R[index_outside] = np.random.uniform(
+          -R, R, size=(len(index_outside[0]), 2))
+      index_outside = np.where(np.linalg.norm(r0_R, axis=1, ord=2) > R)
     r0_R[np.where(r0_R[:, 0] < 0), 0] -= L/2
     r0_R[np.where(r0_R[:, 0] >= 0), 0] += L/2
 
@@ -350,11 +355,10 @@ class Universe():
               z1 = (z0+z1)/2
             # Left part
             if (x1 < -L/2):
-              if (x1<-R-L/2):
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             -R-L/2, 0,
-                                             1, 0)
+              if ((x1+L/2)**2+z1**2 > R**2):
+                x1, z1 = bc.ReflectIntoCircleSimplify(x0, z0,
+                                                      x1, z1,
+                                                      -L/2, 0., R)
                 toCheck = True
               elif z1 > h/2 and x0 > -L/2:
                 t = (z0-h/2)/(z0-z1)
@@ -380,11 +384,10 @@ class Universe():
                   toCheck = True
             # Right part
             elif (x1 > +L/2):
-              if (x1>+R+L/2):
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             +R+L/2, 0,
-                                             1, 0)
+              if ((x1-L/2)**2+z1**2 > R**2):
+                x1, z1 = bc.ReflectIntoCircleSimplify(x0, z0,
+                                                      x1, z1,
+                                                      +L/2, 0., R)
                 toCheck = True
               elif z1 > h/2 and x0 < +L/2:
                 t = (z0-h/2)/(z0-z1)
@@ -505,9 +508,6 @@ class Universe():
                   toCheck = True
             i_BOUNCE += 1
             # toCheck=False
-          # Periodic boundary condition along z:
-          z1 = (R - z1)%(2*R) - R
-
           if x1 <= -L/2:
             cuda.atomic.add(inside, step, 1)
 
@@ -540,16 +540,16 @@ class Universe():
     # Draw particles as scatter
     ax.scatter(pos[:, 0], pos[:, 1], s)
     # Draw geometry
-
-    ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
-    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
-
-    ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
-    ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
+    ax.plot(R*np.cos(np.linspace(np.pi/2, 3*np.pi/2, 100))-L/2,
+            R*np.sin(np.linspace(np.pi/2, 3*np.pi/2, 100)), **border_kwargs)
+    ax.plot(-R*np.cos(np.linspace(np.pi/2, 3*np.pi/2, 100))+L/2,
+            R*np.sin(np.linspace(np.pi/2, 3*np.pi/2, 100)), **border_kwargs)
+    ax.plot([-L/2, -L/2], [R+h/2, h/2], **border_kwargs)
+    ax.plot([+L/2, +L/2], [R+h/2, h/2], **border_kwargs)
     ax.plot([-L/2, +L/2], [h/2, h/2], **border_kwargs)
     ax.plot([-L/2, +L/2], [-h/2, -h/2], **border_kwargs)
-    ax.plot([-L/2, -L/2], [-R, -h/2], **border_kwargs)
-    ax.plot([+L/2, +L/2], [-R, -h/2], **border_kwargs)
+    ax.plot([-L/2, -L/2], [-R-h/2, -h/2], **border_kwargs)
+    ax.plot([+L/2, +L/2], [-R-h/2, -h/2], **border_kwargs)
     ax.set_xlabel('x [Å]')
     ax.set_ylabel('y [Å]')
     ax.set_aspect('equal')
