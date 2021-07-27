@@ -2,11 +2,11 @@ import math
 import time
 from pathlib import Path
 
-import cupy as cp
 import matplotlib.pyplot as plt
 import numba as nb
 import numpy as np
 from netCDF4 import Dataset
+import h5py
 from numba import cuda
 from numba.cuda.random import (create_xoroshiro128p_states,
                                xoroshiro128p_normal_float32)
@@ -56,9 +56,6 @@ class Universe():
       threadsperblock (int, optional): Number of thread per block. Default to 128
       seed (int): set seed
     """
-    self._mempool = cp.get_default_memory_pool()
-    self._pinned_mempool = cp.get_default_pinned_memory_pool()
-
     # Define timestep
     self._dt = dt
     self._step = 0  # current step
@@ -73,9 +70,6 @@ class Universe():
     # Fix computation precision (TODO: make it compatible with saving in netcdf file)
     self._dtype = 'float32'
 
-    # Fill randomly the geometry
-    self._pos = cp.asarray(self._fillGeometry())
-
     # Cut the time axis into batch of gpu-computation in order to fill the gpu memory
     # 2GiB in default #TODO : not properly handled
     gpu_memory = kwargs.get('gpu_memory', 2*1024**3)
@@ -87,35 +81,37 @@ class Universe():
     # Set seed if defined by user or use the system clock as seed
     self._initial_seed = kwargs.get('seed', time.time_ns())
     np.random.seed(self._initial_seed%(2**32-1))
-    cp.random.seed(self._initial_seed%(2**32-1))
+
+    # Fill randomly the geometry
+    self._pos = self._fillGeometry()
 
     # Compile physical engine
     self._compile()
-
+    
     self._output_path = output_path
     if not kwargs.get('_outputFileProvided', False):
       # Create a netcdf simulation file
       self._initOutputFile(output_path)
   
   @classmethod
-  def from_nc(cls, input_path: str):
-    """Create Universe from netcdf file previously created
+  def from_hdf5(cls, input_path: str):
+    """Create Universe from hdf5 file previously created
 
     Args:
-      input_path (str): Netcdf file
+      input_path (str): hdf5 file
     """
 
     input_path = Path(input_path).resolve()
     if not input_path.exists():
       raise FileNotFoundError(f"{str(input_path)} doesn't exist.")
 
-    with Dataset(str(input_path), "r", format="NETCDF4") as rootgrp:
-      u = cls(N=rootgrp['particles'].N,
-              L=rootgrp['geometry']['channel'].L,
-              h=rootgrp['geometry']['channel'].h,
-              R=rootgrp['geometry']['left_reservoir'].R,
-              D=rootgrp['particles']['1'].D,
-              dt=rootgrp.dt,
+    with h5py.File(str(input_path), "r") as f:
+      u = cls(N=f['particles'].attrs['N'],
+              L=f['geometry']['channel'].attrs['L'],
+              h=f['geometry']['channel'].attrs['h'],
+              R=f['geometry']['reservoir'].attrs['R'],
+              D=f['particles']['0'].attrs['D'],
+              dt=f.attrs['dt'],
               output_path=input_path,
               _outputFileProvided=True)
     return u
@@ -124,7 +120,7 @@ class Universe():
   @property
   def pos(self):
     """array: current position of particles (in A)."""
-    return self._pos.get()
+    return self._pos
 
   @property
   def N(self):
@@ -173,15 +169,14 @@ class Universe():
   #endregion
 
   def __len__(self):
-    with Dataset(self._output_path, "r", format="NETCDF4") as rootgrp:
-      N_runs = len(rootgrp['run/'].groups)
+    with h5py.File(self._output_path, "r") as f:
+      N_runs = f['run'].attrs['N_runs']
     return N_runs
 
   def __getitem__(self, key):
     data = {}
-
-    with Dataset(self._output_path, "r", format="NETCDF4") as rootgrp:
-      groups_keys = list(rootgrp['run/'].groups.keys())
+    with h5py.File(self._output_path, "r") as f:
+      groups_keys = list(f['run'])
 
     if isinstance(key, int):
       key = str(key)
@@ -190,10 +185,10 @@ class Universe():
       split = 1000
       if key not in groups_keys:
         raise KeyError(f"Available runs : {', '.join(groups_keys)}")
-      with Dataset(self._output_path, "r", format="NETCDF4") as rootgrp:
-        for key, value in rootgrp[f'run/{key}'].variables.items():
+      with h5py.File(self._output_path, "r") as f:
+        for key, value in f[f'run/{key}'].items():
           print(f'Reading {key} ...')
-          # chunk is too slow !
+          # TODO: Test chunck with h5py
           # data[key] = np.empty(shape = value.shape, 
           #                      dtype = value.dtype)
           # if value.ndim==1: # region variable
@@ -201,13 +196,12 @@ class Universe():
           #   pbar = tqdm(total=total)
           #   for i in range(0, total, split):
           #     value[i:i+split]
-          data[key] = value[:]
+          data[key] = value[...]
           print(f'... Done')
       return data
     else:
       raise TypeError(f'universe indices must be integers or str, not {type(key)}')
     
-
   def _initOutputFile(self, output_path: str):
     """Create and initialize the netcdf simulation file
     Args:
@@ -216,6 +210,7 @@ class Universe():
     # Check if the file already exists.
     # If yes, the file name will be incremented.
     output_path = Path(output_path).resolve()
+    output_path = output_path.with_suffix('.hdf5')
     if output_path.exists():
         i = 1
         output_path_inc = output_path.with_name(
@@ -231,63 +226,39 @@ class Universe():
     # Store output path name as attribut
     self._output_path = str(output_path)
 
-    # # Create NETCDF4 file
-    rootgrp = Dataset(self.output_path,
-                      "w", format="NETCDF4")
-    # Some general infos stored as attributes
-    rootgrp.source = 'Created with BM_cuda'
-    rootgrp.version = self.__version__
-    rootgrp.date = "Created " + time.ctime(time.time())
-    rootgrp.units = 'real'  # We use LAMMPS real units
-    rootgrp.dt = self.dt
-    rootgrp.dtype = self._dtype
+    # # Create hdf5 file
+    with h5py.File(self.output_path, 'w') as f:
+      f.attrs['source'] = 'Created with BM_cuda'
+      f.attrs['version'] = self.__version__
+      f.attrs['date'] = "Created " + time.ctime(time.time())
+      f.attrs['units'] = 'real'  # We use LAMMPS real units
+      f.attrs['dt'] = self.dt
+      f.attrs['dtype'] = self._dtype
+      f.attrs['ndim'] = 2 # Specify that it is a 2D simulation
+      f.create_group
+      particlesgrp = f.create_group('particles')
+      particlesgrp.attrs['N'] = self.N # Specify total number of particles
+      particlesgrp.attrs['_seed'] = self._initial_seed
+      particlesgrp.create_dataset("initial_pos", data=self.pos)
+      particlesgrp.create_dataset("type", data=[0]*self.N, dtype=np.uint8)
+      particlegrp_0 = particlesgrp.create_group('0')
+      particlegrp_0.attrs['type'] = 0
+      particlegrp_0.attrs['D'] = self.D
 
-    # Specify that it is a 2D simulation
-    dim = rootgrp.createDimension("dim", 2)
-    # Dimension idexing all particles
-    rootgrp.createDimension("idx", self.N)
-    # Create a group that will store information on particles
-    # Like a topology folder
-    # It will make sens if we have 2 types of particles (A and B) with
-    # opposing charge for example.
+      # Create a group holding informations about geometry
+      geomgrp = f.create_group("geometry")
+      Rgrp = geomgrp.create_group("reservoir")
+      Rgrp.attrs['R'] = self.R
+      Rgrp.attrs['bc_bulk'] = 'elastic simplified'
+      Rgrp.attrs['bc_membrane'] = 'elastic'
 
-    particlesgrp = rootgrp.createGroup("particles")
-    particlesgrp.N = self.N
+      Cgrp = geomgrp.create_group("channel")
+      Cgrp.attrs['L'], Cgrp.attrs['h'] = self.L, self.h
+      Cgrp.attrs['bc'] = 'elastic'
 
-    pos = particlesgrp.createVariable("initial_pos", "f4", ("idx", "dim"))
-    pos[:, :] = self.pos
-
-    pos = particlesgrp.createVariable("current_pos", "f4", ("idx", "dim"))
-    pos[:, :] = self.pos
-
-    particlegrp_0 = particlesgrp.createGroup("1")
-    particlegrp_0.type = 'A'
-    particlegrp_0.D = self.D
-    particlegrp_0.N = self.N
-
-    # Create a group holding informations about geometry
-    geomgrp = rootgrp.createGroup("geometry")
-    LRgrp = geomgrp.createGroup("left_reservoir")
-    LRgrp.R = self.R
-    LRgrp.bc = 'elastic simplified'
-
-    RRgrp = geomgrp.createGroup("right_reservoir")
-    RRgrp.R = self.R
-    RRgrp.bc = 'elastic simplified'
-
-    Cgrp = geomgrp.createGroup("channel")
-    Cgrp.L, Cgrp.h = self.L, self.h
-    Cgrp.bc = 'elastic'
-
-    # Create a group that will hold informations about simulations
-    rungrp = rootgrp.createGroup("run")
-    rungrp.run_number = 0  # number of simulation perfomed until now
-
-    # Create a group for other paramaters (like the seed)
-    sysgrp = rootgrp.createGroup("_sys")
-    sysgrp.initial_seed = self._initial_seed
-
-    rootgrp.close()
+      # Create a group that will hold informations about simulations
+      rungrp = f.create_group("run")
+      rungrp.attrs['N_runs'] = 0  # number of simulation perfomed until now
 
   def _fillGeometry(self):
     """Randomly fill the geometry
@@ -345,324 +316,9 @@ class Universe():
     blockspergrid = math.ceil(self.N / threadsperblock)
     dtype = self._dtype
 
-    @cuda.jit(f'void({dtype}[:,:], {dtype}[:,:,:], uint32[:,:,:], {dtype}[:,:,:], uint32)')
-    def engine_dump(r, dr, inside, history, step0):
-      """Physical engine function compiled in CUDA to simulate pure brownian
-      motion particles.
-
-      Args:
-        r (float32[:,:]): Initial position of particles
-        dr (float32[:,:,:]): Displacement normaly generated with cupy (way faster than numba for now
-                           see https://numba.discourse.group/t/random-array-generation-numba-cuda-slower-than-cupy/815)
-        inside (uint32[:,:,:]): ouput array that will store the number of particles in predefinned regions as function of time 
-        history (float32[:,:,:]): output array that wil store trajectory every custom timestep
-        step0 (uint32): inital timestep
-      """
-      freq_dumps = math.ceil(dr.shape[2]/history.shape[2])
-      pos = cuda.grid(1)
-      if pos < r.shape[0]:
-        i_DUMP = 0
-        for step in range(dr.shape[2]):
-          x0, z0 = r[pos, 0], r[pos, 1]
-          x1, z1 = r[pos, 0] + \
-            dr[pos, 0, step], r[pos, 1]+dr[pos, 1, step]
-          toCheck = True
-          i_BOUNCE = 0
-          while toCheck and i_BOUNCE < MAX_BOUNCE:
-            toCheck = False
-            if i_BOUNCE > 4:
-              # print(x1, z1)
-              x1 = (x0+x1)/2
-              z1 = (z0+z1)/2
-            # Left part
-            if (x1 < -L/2):
-              if ((x1+L/2)**2+z1**2 > R**2):
-                x1, z1 = bc.ReflectIntoCircleSimplify(x0, z0,
-                                                      x1, z1,
-                                                      -L/2, 0., R)
-                toCheck = True
-              elif z1 > h/2 and x0 > -L/2:
-                t = (z0-h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = h/2
-                if xint > -L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-              elif z1 < -h/2 and x0 > -L/2:
-                t = (z0+h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = -h/2
-
-                if xint > -L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            # Right part
-            elif (x1 > +L/2):
-              if ((x1-L/2)**2+z1**2 > R**2):
-                x1, z1 = bc.ReflectIntoCircleSimplify(x0, z0,
-                                                      x1, z1,
-                                                      +L/2, 0., R)
-                toCheck = True
-              elif z1 > h/2 and x0 < +L/2:
-                t = (z0-h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = h/2
-                if xint < +L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-              elif z1 < -h/2 and x0 < +L/2:
-                t = (z0+h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = -h/2
-                if xint < +L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            # Middle part
-            else:
-              if x0 < -L/2 and x1 > -L/2:
-                # Intersection with x=-L/2
-                t = (x0+L/2)/(x0-x1)
-                xint = -L/2
-                zint = t*z1 + (1-t)*z0
-                if math.fabs(zint) > h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                -L/2, 0,
-                                                1, 0)
-                  toCheck = True
-                else:
-                  if z1 > h/2:
-                    x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                  x1, z1,
-                                                  0, h/2,
-                                                  0, 1)
-                    toCheck = True
-                  elif z1 < -h/2:
-                    x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                  x1, z1,
-                                                  0, -h/2,
-                                                  0, 1)
-                    toCheck = True
-              elif x0 > L/2 and x1 < L/2:
-                  # Intersection with x=+L/2
-                  t = (x0-L/2)/(x0-x1)
-                  xint = +L/2
-                  zint = t*z1 + (1-t)*z0
-                  if math.fabs(zint) > h/2:
-                      x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                    x1, z1,
-                                                    +L/2, 0,
-                                                    1, 0)
-                      toCheck = True
-                  else:
-                      if z1 > h/2:
-                          x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                        x1, z1,
-                                                        0, h/2,
-                                                        0, 1)
-                          toCheck = True
-                      elif z1 < -h/2:
-                          x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                        x1, z1,
-                                                        0, -h/2,
-                                                        0, 1)
-                          toCheck = True
-              else:  # x0 and x1 inside the channel
-                if z1 > h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-                elif z1 < -h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            i_BOUNCE += 1
-            # toCheck=False
-          if x1 <= -L/2:
-            inside[pos, 0, step] += 1
-          elif x1 >= +L/2:
-            inside[pos, 1, step] += 1
-
-          if (step + step0) % freq_dumps == 0:
-            history[pos, 0, i_DUMP] = x0
-            history[pos, 1, i_DUMP] = z0
-            i_DUMP += 1
-
-          r[pos, 0], r[pos, 1] = x1, z1
-
-    @cuda.jit(f'void({dtype}[:,:], {dtype}[:,:,:], uint32[:,:,:])')
-    def engine(r, dr, inside):
-      """Physical engine function compiled in CUDA to simulate pure brownian
-      motion particles.
-
-      Args:
-        r (float32[:,:]): Initial position of particles 
-        dr (float32[:,:,:]): Displacement normaly generated with cupy (way faster than numba for now
-                           see https://numba.discourse.group/t/random-array-generation-numba-cuda-slower-than-cupy/815)
-        inside (uint32[:,:,:]): ouput array that will store the number of particles in predefinned regions as function of time 
-      """
-      
-      pos = cuda.grid(1)
-      if pos < r.shape[0]:
-        i_DUMP = 0
-        for step in range(dr.shape[2]):
-          x0, z0 = r[pos, 0], r[pos, 1]
-          x1, z1 = r[pos, 0] + \
-            dr[pos, 0, step], r[pos, 1]+dr[pos, 1, step]
-          toCheck = True
-          i_BOUNCE = 0
-          while toCheck and i_BOUNCE < MAX_BOUNCE:
-            toCheck = False
-            if i_BOUNCE > 4:
-              # print(x1, z1)
-              x1 = (x0+x1)/2
-              z1 = (z0+z1)/2
-            # Left part
-            if (x1 < -L/2):
-              if ((x1+L/2)**2+z1**2 > R**2):
-                x1, z1 = bc.ReflectIntoCircleSimplify(x0, z0,
-                                                      x1, z1,
-                                                      -L/2, 0., R)
-                toCheck = True
-              elif z1 > h/2 and x0 > -L/2:
-                t = (z0-h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = h/2
-                if xint > -L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-              elif z1 < -h/2 and x0 > -L/2:
-                t = (z0+h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = -h/2
-
-                if xint > -L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            # Right part
-            elif (x1 > +L/2):
-              if ((x1-L/2)**2+z1**2 > R**2):
-                x1, z1 = bc.ReflectIntoCircleSimplify(x0, z0,
-                                                      x1, z1,
-                                                      +L/2, 0., R)
-                toCheck = True
-              elif z1 > h/2 and x0 < +L/2:
-                t = (z0-h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = h/2
-                if xint < +L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-              elif z1 < -h/2 and x0 < +L/2:
-                t = (z0+h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = -h/2
-                if xint < +L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            # Middle part
-            else:
-              if x0 < -L/2 and x1 > -L/2:
-                # Intersection with x=-L/2
-                t = (x0+L/2)/(x0-x1)
-                xint = -L/2
-                zint = t*z1 + (1-t)*z0
-                if math.fabs(zint) > h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                -L/2, 0,
-                                                1, 0)
-                  toCheck = True
-                else:
-                  if z1 > h/2:
-                    x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                  x1, z1,
-                                                  0, h/2,
-                                                  0, 1)
-                    toCheck = True
-                  elif z1 < -h/2:
-                    x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                  x1, z1,
-                                                  0, -h/2,
-                                                  0, 1)
-                    toCheck = True
-              elif x0 > L/2 and x1 < L/2:
-                  # Intersection with x=+L/2
-                  t = (x0-L/2)/(x0-x1)
-                  xint = +L/2
-                  zint = t*z1 + (1-t)*z0
-                  if math.fabs(zint) > h/2:
-                      x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                    x1, z1,
-                                                    +L/2, 0,
-                                                    1, 0)
-                      toCheck = True
-                  else:
-                      if z1 > h/2:
-                          x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                        x1, z1,
-                                                        0, h/2,
-                                                        0, 1)
-                          toCheck = True
-                      elif z1 < -h/2:
-                          x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                        x1, z1,
-                                                        0, -h/2,
-                                                        0, 1)
-                          toCheck = True
-              else:  # x0 and x1 inside the channel
-                if z1 > h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-                elif z1 < -h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            i_BOUNCE += 1
-            # toCheck=False
-          if x1 <= -L/2:
-            inside[pos, 0, step] += 1
-          elif x1 >= +L/2:
-            inside[pos, 1, step] += 1
-
-          r[pos, 0], r[pos, 1] = x1, z1
-        
     # @cuda.jit(f'void({dtype}[:,:], uint64)')
     @cuda.jit
-    def engine_dev(r0, t0, N_steps, sig, inside, rng_states, trajectory, freq_dumps):
+    def engine(r0, t0, N_steps, sig, inside, rng_states, trajectory, freq_dumps):
       """Physical engine function compiled in CUDA to simulate pure brownian
       motion particles.
 
@@ -885,8 +541,6 @@ class Universe():
         t0 += N_steps
         
     self.engine = engine[blockspergrid, threadsperblock]
-    self.engine_dev = engine_dev[blockspergrid, threadsperblock]
-    self.engine_dump = engine_dump[blockspergrid, threadsperblock]
 
   def plotPosition(self, s=0.1, **fig_kwargs):
     """Plot current position of particles
@@ -920,359 +574,135 @@ class Universe():
 
     return fig, ax
 
-  def run(self, N_steps, freq_dumps=None):
+  def run(self, N_steps, freq_dumps=0, **kwargs):
     """Plot current position of particles
 
     Args:
       s (float, optional): size of scatter. Default to 0.1
       fig_kwargs (optional): Paramter to pass to plt.subplots
     """
-    N_particles = self.N
-    batchSize = self._batchSize
-    Nbatch = math.floor(N_steps/batchSize)
-    D, dt = self.D, self.dt
-    step0 = self._step
-    dtype = self._dtype
-    inside = []
-    trajectory = []
-    pbar = tqdm(total=N_steps)
-
-    e0 = cp.cuda.Event()
-    e1, e2, e3 = cp.cuda.Event(), cp.cuda.Event(), cp.cuda.Event()
-    dt0 = []
-    dt1 = []
-    dt2 = []
-    pos_GPU = cuda.to_device(self._pos)
-    for i in range(Nbatch):
-      e0.record()
-      _inside = cp.zeros((N_particles, 2, batchSize),
-                          dtype=cp.uint32)
-      e1.record()
-      _dr = cp.random.normal(loc=0, scale=math.sqrt(6*D*dt),
-                              size=(N_particles, 2, batchSize),
-                              dtype=dtype)
-      e2.record()
-      if freq_dumps is None:
-        self.engine(pos_GPU, _dr, _inside)
-      else:
-        N_dumps = math.ceil(batchSize/freq_dumps)
-        _trajectory = cp.zeros((N_particles, 2, N_dumps),
-                                dtype=dtype)
-        print(_trajectory.shape)
-        self.engine_dump(pos_GPU, _dr, _inside,
-                          _trajectory, cp.uint32(self._step))
-        print(_trajectory[0, :, 0])
-        trajectory.append(_trajectory.get())
-      e3.record()
-      e3.synchronize()
-      inside.append(_inside.sum(axis=0).get())
-      self._step += batchSize
-      pbar.update(batchSize)
-      pbar.set_postfix_str(f'{prefix(i*batchSize*self.dt*1E-15)}s')
-      dt0.append(cp.cuda.get_elapsed_time(e0, e1))
-      dt1.append(cp.cuda.get_elapsed_time(e1, e2))
-      dt2.append(cp.cuda.get_elapsed_time(e2, e3))
-    inside = np.hstack(inside)
-    dt0, dt1, dt2 = np.mean(dt0[2:]), np.mean(dt1[2:]), np.mean(dt2[2:])
-    dt_total = dt0+dt1+dt2
-    print('\n')
-    print(f'With {N_particles} particles')
-    print(f'GPU time per step:')
-    print(f'cp.zeros: {dt0/batchSize*1E3:.3f} us')
-    print(f'cp.random.normal: {dt1/batchSize*1E3:.3f} us')
-    print(f'engine: {dt2/batchSize*1E3:.3f} us')
-    print(f'Total: {dt_total/batchSize*1E3:.3f} us')
-    print(f'Need {(dt_total/batchSize)*(1E12/dt)*1E-3:.2f}s to compute 1ms of simulation')
-    rootgrp = Dataset(self.output_path,
-                      "a", format="NETCDF4")
-
-    if 'run' not in rootgrp.groups:
-      rootgrp.createGroup(f'run')
-    runsgrp = rootgrp['run']
-
-    i = 0
-    while f'{i}' in runsgrp.groups:
-        i += 1
-    rungrp = runsgrp.createGroup(f'{i}')
-    rungrp.status = 'SUCCEED'
-    rungrp.step_i = step0
-    rungrp.step_f = self._step
-    rungrp.createDimension("step", N_steps)
-    for i in range(_inside.shape[1]):
-      # regiongrp = rungrp.createGroup(f'region_{i}')
-      # inside_region = regiongrp.createVariable("N","u4",("idx","step"))
-      inside_region = rungrp.createVariable(
-          f'region_{i}', "u4", ("step"))
-      inside_region[:] = inside[i, :]
-    rungrp['region_0'].definition = 'x<=L/2'
-    rungrp['region_1'].definition = 'x>=L/2'
-
-    if freq_dumps is not None:
-      rootgrp.createDimension("step", None)
-      trajectory = np.concatenate(trajectory, axis=2)
-
-      rungrp.createDimension("dump_step", N_steps//freq_dumps+1)
-      trajvar = rungrp.createVariable(
-          f'trajectory', "f4", ("idx", "dim", "dump_step"), zlib=True)
-      trajvar[:, :, :] = trajectory[:, :, :]
-      print(trajectory[0, :, 0])
-      print(trajvar[0, :, 0])
-      trajvar.freq_dumps = freq_dumps
-    rootgrp.close()
-
-    del pos_GPU, _inside
-    self._mempool.free_all_blocks()
-    self._pinned_mempool.free_all_blocks()
-    return True
-
-  def run2(self, N_steps, freq_dumps=0):
-    """Plot current position of particles
-
-    Args:
-      s (float, optional): size of scatter. Default to 0.1
-      fig_kwargs (optional): Paramter to pass to plt.subplots
-    """
-    chunk_size = 100_000 #dask ???
-
-    # TODO : add a warmup
-    
-    freq_dumps = nb.uint32(freq_dumps)
-    N_particles = self.N
-    D, dt = self.D, self.dt
-    dtype = self._dtype
-    
-    N_steps = nb.uint64(N_steps)
-    step0 = self._step
-    # pbar = tqdm(total=N_steps)
-    scale = nb.float32(math.sqrt(2*D*dt))
-    if freq_dumps==0:
-      trajectory = np.zeros((N_particles,2,0), dtype=np.float32)
-    else:
-      N_dumps = math.floor(N_steps/freq_dumps)+1
-      trajectory = np.zeros((N_particles,2,N_dumps), dtype=np.float32)
-    
-    inside = np.zeros(N_steps, np.uint32)
-    
-    e0 = cp.cuda.Event()
-    e1, e2, e3 = cp.cuda.Event(), cp.cuda.Event(), cp.cuda.Event()
-    dt0 = []
-    dt1 = []
-    dt2 = []
-    e0.record()
-    d_trajectory =  cuda.to_device(trajectory)
-    dpos = cuda.to_device(self._pos)
-    d_inside = cuda.to_device(inside)
-    rng_states = create_xoroshiro128p_states(N_particles, seed=1)
-    e1.record()
-    self.engine_dev(dpos, N_steps, scale, d_inside, rng_states, d_trajectory, freq_dumps)
-    e2.record()
-    d_inside.copy_to_host(inside)
-    d_trajectory.copy_to_host(trajectory)
-    e3.record()
-    e3.synchronize()
-    dt0 = cp.cuda.get_elapsed_time(e0, e1)
-    dt1 = cp.cuda.get_elapsed_time(e1, e2)
-    dt2 = cp.cuda.get_elapsed_time(e2, e3)
-    dt_total = dt0+dt1+dt2
-    print('\n')
-    print(f'With {N_particles} particles')
-    print(f'GPU time per step:')
-    print(f'cp.zeros: {dt0/N_steps*1E3:.3f} us')
-    print(f'cp.random.normal: {dt1/N_steps*1E3:.3f} us')
-    print(f'engine: {dt2/N_steps*1E3:.3f} us')
-    print(f'Total: {dt_total/N_steps*1E3:.3f} us')
-    print(f'Need {(dt_total/N_steps)*(1E12/dt)*1E-3:.2f}s to compute 1ms of simulation')
-
-    rootgrp = Dataset(self.output_path,
-                      "a", format="NETCDF4")
-
-    
-    if 'run' not in rootgrp.groups:
-      rootgrp.createGroup(f'run')
-    runsgrp = rootgrp['run']
-
-    i = 0
-    while f'{i}' in runsgrp.groups:
-        i += 1
-    rungrp = runsgrp.createGroup(f'{i}')
-    rungrp.status = 'SUCCEED'
-    rungrp.step_i = step0
-    rungrp.step_f = self._step
-    rungrp.createDimension("step", N_steps)
-    inside_region = rungrp.createVariable(
-          'region_0', "u4", ("step"))
-    inside_region.definition = 'x<=L/2'
-    inside_region[:] = inside[:]
-
-    if freq_dumps!=0:
-      rungrp.createDimension("dump_step", N_dumps)
-      trajvar = rungrp.createVariable(
-          f'trajectory', "f4", ("idx", "dim", "dump_step"), zlib=True)
-      # print(trajvar.shape, trajectory.shape)
-      trajvar[:, :, :] = trajectory[:, :, :]
-      trajvar.freq_dumps = freq_dumps
-
-    rootgrp.close()
-    del d_trajectory, d_inside
-    # self._mempool.free_all_blocks()
-    # self._pinned_mempool.free_all_blocks()
-    return True
-  
-  def run3(self, N_steps, freq_dumps=0):
-    """Plot current position of particles
-
-    Args:
-      s (float, optional): size of scatter. Default to 0.1
-      fig_kwargs (optional): Paramter to pass to plt.subplots
-    """
-    with Dataset(self.output_path,
-                      "a", format="NETCDF4") as rootgrp:
-
-      if 'run' not in rootgrp.groups:
-        rootgrp.createGroup(f'run')
-      runsgrp = rootgrp['run']
-
-      i = 0
-      while f'{i}' in runsgrp.groups:
-          i += 1
-      rungrp = runsgrp.createGroup(f'{i}')
-      rungrp.status = 'UNCOMPLET'
-      rungrp.step_i = self._step
-      rungrp.step_f = self._step + N_steps
-      rungrp.createDimension("step", N_steps)
-      inside_region = rungrp.createVariable(
-            'region_0', "u4", ("step"))
-      inside_region.definition = 'x<=L/2'
-
-      if freq_dumps!=0:
-        N_dumps = math.floor(N_steps/freq_dumps)
-        rungrp.createDimension("dump_step", N_dumps)
-        trajvar = rungrp.createVariable(
-            f'trajectory', "f4", ("idx", "dim", "dump_step"), zlib=True)
-        trajvar.freq_dumps = freq_dumps
-
     max_chunk_size = 100_000 # TODO : dask ???
 
-    # TODO : add a warmup
-    N_steps = nb.uint64(N_steps)
-    freq_dumps = nb.uint32(freq_dumps)
-    N_particles = self.N
-    D, dt = self.D, self.dt
-    scale = nb.float32(math.sqrt(2*D*dt))
-    dtype = self._dtype
+    with h5py.File(self._output_path, 'a') as f:
+      runsgrp = f['run']
 
-    # Transfert current position to device
-    dpos = cuda.to_device(self._pos)
-
-    rng_states = create_xoroshiro128p_states(N_particles, seed=self._initial_seed) # TODO : need to change that after each run !
-
-    inside = np.zeros(N_steps, np.uint32)
-    if freq_dumps==0:
-      trajectory = np.zeros((N_particles,2,0), dtype=np.float32)
-    else:
-      N_dumps = math.floor(N_steps/freq_dumps)
-      trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
-
-    # i_step = self._step 
-    pbar = tqdm(total=math.ceil(N_steps))
-    for i_chunk, i_step in enumerate(range(0, N_steps, max_chunk_size)):
-      chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
-      chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
-
-      # Allocate device memory to store trajectory
-      if freq_dumps==0:
-        i_trajectory = np.zeros((N_particles,2,0), dtype=np.float32)
-      else:
-        N_dumps = math.floor(chunk_size/freq_dumps)
-        i_trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
-      d_trajectory =  cuda.to_device(i_trajectory)
-
-      # Allocate device memory to store number of particle in region 0
-      i_inside = np.zeros(chunk_size, np.uint32)
-      d_inside = cuda.to_device(i_inside)
-
-      self.engine_dev(dpos, self._step, chunk_size, scale, d_inside, 
-                      rng_states, d_trajectory, freq_dumps)
-
-      d_inside.copy_to_host(inside[i_step:i_step + max_chunk_size])
-      if freq_dumps!=0:
-        d_trajectory.copy_to_host(i_trajectory)
-        N_dumps = math.floor(max_chunk_size/freq_dumps)
-        trajectory[:,:,N_dumps*i_chunk:N_dumps*(i_chunk + 1)] = i_trajectory
-
-      self._step += chunk_size
-      pbar.set_postfix(total = f'{prefix(self._step*self.dt*1E-15)}s')
-      pbar.update(chunk_size)
+      i = 0
+      while f'{i}' in runsgrp:
+          i += 1
+      rungrp = runsgrp.create_group(f'{i}')
+      rungrp.status = 'UNCOMPLETED'
+      rungrp.step_i = self._step
+      rungrp.step_f = self._step + N_steps
       
-    pass
-    with Dataset(self.output_path, "a", 
-                  format="NETCDF4") as rootgrp:
-      rootgrp[f'run/{i}/region_0'][:] = inside
+      region_0_ds = rungrp.create_dataset('region_0', dtype=np.uint16, 
+                                            shape=(N_steps),
+                                            chunks=(max_chunk_size))
+      region_0_ds.attrs['definition'] = 'x<=L/2'
+
+      freq_dumps = nb.uint32(freq_dumps)
       if freq_dumps!=0:
-        rootgrp[f'run/{i}/trajectory'][:] = trajectory
-    # e0 = cp.cuda.Event()
-    # e1, e2, e3 = cp.cuda.Event(), cp.cuda.Event(), cp.cuda.Event()
-    # dt0 = []
-    # dt1 = []
-    # dt2 = []
-    # e0.record()
-    # d_trajectory =  cuda.to_device(trajectory)
-    # dpos = cuda.to_device(self._pos)
-    # 
-    # rng_states = create_xoroshiro128p_states(N_particles, seed=1)
-    # e1.record()
-    # 
-    # e2.record()
-    # d_inside.copy_to_host(inside)
-    # d_trajectory.copy_to_host(trajectory)
-    # e3.record()
-    # e3.synchronize()
-    # dt0 = cp.cuda.get_elapsed_time(e0, e1)
-    # dt1 = cp.cuda.get_elapsed_time(e1, e2)
-    # dt2 = cp.cuda.get_elapsed_time(e2, e3)
-    # dt_total = dt0+dt1+dt2
-    # print('\n')
-    # print(f'With {N_particles} particles')
-    # print(f'GPU time per step:')
-    # print(f'cp.zeros: {dt0/N_steps*1E3:.3f} us')
-    # print(f'cp.random.normal: {dt1/N_steps*1E3:.3f} us')
-    # print(f'engine: {dt2/N_steps*1E3:.3f} us')
-    # print(f'Total: {dt_total/N_steps*1E3:.3f} us')
-    # print(f'Need {(dt_total/N_steps)*(1E12/dt)*1E-3:.2f}s to compute 1ms of simulation')
-
-    # rootgrp = Dataset(self.output_path,
-    #                   "a", format="NETCDF4")
-
+        N_dumps = math.floor(N_steps/freq_dumps)
+        max_dumps_per_chunk = math.floor(max_chunk_size/freq_dumps)
+        traj_ds = rungrp.create_dataset('trajectory', dtype=self._dtype, 
+                                        shape=(self.N,2,N_dumps),
+                                        chunks=(self.N,2,max_dumps_per_chunk)
+                                        # chunks=(self.N,2,N_dumps)
+                                        # ValueError: Number of elements in chunk must be < 4gb (number of elements in chunk must be < 4GB)
+                                        )
+        # TODO: resize faster
+        traj_ds.attrs['freq_dumps'] = freq_dumps
+      else:
+        N_dumps = 0
     
-    # if 'run' not in rootgrp.groups:
-    #   rootgrp.createGroup(f'run')
-    # runsgrp = rootgrp['run']
+      N_steps = nb.uint64(N_steps) # Total number of steps
 
-    # i = 0
-    # while f'{i}' in runsgrp.groups:
-    #     i += 1
-    # rungrp = runsgrp.createGroup(f'{i}')
-    # rungrp.status = 'SUCCEED'
-    # rungrp.step_i = step0
-    # rungrp.step_f = self._step
-    # rungrp.createDimension("step", N_steps)
-    # inside_region = rungrp.createVariable(
-    #       'region_0', "u4", ("step"))
-    # inside_region.definition = 'x<=L/2'
-    # inside_region[:] = inside[:]
+      N_chunks = math.ceil(N_steps/max_chunk_size) # Number of chunk
+        
+      N_particles = self.N
+      D, dt = self.D, self.dt
+      scale = nb.float32(math.sqrt(2*D*dt))
+      dtype = self._dtype
 
-    # if freq_dumps!=0:
-    #   rungrp.createDimension("dump_step", N_dumps)
-    #   trajvar = rungrp.createVariable(
-    #       f'trajectory', "f4", ("idx", "dim", "dump_step"), zlib=True)
-    #   # print(trajvar.shape, trajectory.shape)
-    #   trajvar[:, :, :] = trajectory[:, :, :]
-    #   trajvar.freq_dumps = freq_dumps
+      # Transfert current position to device
+      d_pos = cuda.to_device(self._pos)
 
-    # rootgrp.close()
-    # del d_trajectory, d_inside
-    # # self._mempool.free_all_blocks()
-    # # self._pinned_mempool.free_all_blocks()
+      # Create individual random generator states for each CUDA thread 
+      # Note: max independant number generation : 2**64 (1.8E19)
+      self._initial_seed = np.uint64(kwargs.get('seed', time.time_ns())%(2**64-1))
+      rng_states = create_xoroshiro128p_states(N_particles, seed=self._initial_seed)
+
+      # i_step = self._step 
+      e0, e1, e2, e3 = cuda.event(), cuda.event(), cuda.event(), cuda.event()
+      dt1, dt2, dt3 = [], [], []
+      dt1_cpu, dt2_cpu = [], []
+      pbar = tqdm(total=math.ceil(N_steps))
+      for i_chunk, i_step in enumerate(range(0, N_steps, max_chunk_size)):
+        t0_cpu = time.perf_counter()
+        chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
+        chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
+
+        # Allocate device memory to store number of particle in region 0
+        e0.record()
+        i_inside = np.zeros(chunk_size, np.uint32)
+        d_i_inside = cuda.to_device(i_inside) # Transfert to device memory
+
+        # Allocate memory to store trajectory
+        i_N_dumps = 0 if freq_dumps==0 else math.floor(chunk_size/freq_dumps)
+        i_trajectory = np.zeros((N_particles, 2, i_N_dumps), dtype=np.float32)
+        d_i_trajectory = cuda.to_device(i_trajectory) # Transfert to device memory
+
+        e1.record()
+        self.engine(d_pos, # r0
+                    self._step, # t0 
+                    chunk_size, # N_steps 
+                    scale, # sig
+                    d_i_inside, # inside 
+                    rng_states, # rng_states
+                    d_i_trajectory, # trajectory
+                    freq_dumps #freq_dumps
+                    )
+
+        e2.record()
+        # Transfert results from device to RAM
+        d_i_inside.copy_to_host(i_inside) 
+        if freq_dumps!=0: d_i_trajectory.copy_to_host(i_trajectory)
+        e3.record()
+
+        t1_cpu = time.perf_counter()
+        # Transfert result from RAM to drive
+        region_0_ds[i_step:i_step + max_chunk_size] = i_inside # Transfert result from RAM to drive
+        if freq_dumps!=0:
+          traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = i_trajectory
+
+        self._step += chunk_size
+
+        t2_cpu = time.perf_counter()
+        cuda.synchronize()
+        dt1.append(cuda.event_elapsed_time(e0,e1)*1E-3)
+        dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
+        dt3.append(cuda.event_elapsed_time(e2,e3)*1E-3)
+        dt1_cpu.append(t1_cpu - t0_cpu)
+        dt2_cpu.append(t2_cpu - t1_cpu)
+        pbar.set_postfix(total = f'{prefix(self._step*self.dt*1E-15)}s')
+        pbar.update(chunk_size)
+    pbar.close()
+    dt1, dt2, dt3 = np.mean(dt1), np.mean(dt2), np.mean(dt3)
+    dt1_cpu, dt2_cpu = np.mean(dt1_cpu), np.mean(dt2_cpu)
+    print(f'With {N_particles} particles')
+    print(f'------------------------------------------')
+    print(f'GPU time per step:')
+    print(f'Allocation: {prefix(dt1/N_steps)}s')
+    print(f'Engine: {prefix(dt2/N_steps)}s')
+    print(f'Transfert to RAM: {prefix(dt3/N_steps)}s')
+    print(f'Total: {prefix((dt1+dt2+dt3)/N_steps)}s')
+    print(f'------------------------------------------')
+    print(f'CPU time per step:')
+    print(f'Other: {prefix(dt1_cpu/N_steps)}s')
+    print(f'Transfert to drive: {prefix(dt2_cpu/N_steps)}s')
+    print(f'Total: {prefix((dt1_cpu+dt2_cpu)/N_steps)}s')
+
+    del d_i_trajectory, d_i_inside, d_pos
+    del i_trajectory, i_inside
     # return True
 
 
@@ -1288,6 +718,6 @@ if __name__ == "__main__":
   N= 8*1024
 
   u = Universe(N=N, L=L, h=h, R=R, D=D, dt=dt,
-              output_path='simu.nc')
+              output_path='simu.hdf5')
 
   u.run3(48_023, freq_dumps=10);
