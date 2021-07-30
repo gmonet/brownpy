@@ -10,9 +10,11 @@ import h5py
 from numba import cuda
 from numba.cuda.random import (create_xoroshiro128p_states,
                                xoroshiro128p_normal_float32)
+from numpy.random.mtrand import seed
 from tqdm.auto import tqdm
 
 from brownpy import bc
+from brownpy import topology
 from brownpy.utils import prefix
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
@@ -36,11 +38,12 @@ class Universe():
   __version__ = '0.0.2a'
   MAX_BOUNCE = 10
 
-  def __init__(self, N: int,
-                L: float, h: float, R: float, 
-                D: float, dt: int,
-                output_path: str,
-                **kwargs):
+  def __init__(self,
+               top: topology.Topology,
+               N: int,
+               D: float, dt: int,
+               output_path: str,
+               **kwargs):
     """Create a raw new Universe from topology parameters
 
     Args:
@@ -60,8 +63,8 @@ class Universe():
     self._dt = dt
     self._step = 0  # current step
 
-    # Define geometry
-    self._L, self._h, self._R = L, h, R
+    # Define topology
+    self._top = top
 
     # Define number of particles and their properties
     self._N = N
@@ -83,8 +86,8 @@ class Universe():
     np.random.seed(self._initial_seed%(2**32-1))
 
     # Fill randomly the geometry
-    self._pos = self._fillGeometry()
-
+    self._pos = top.fill_geometry(N, seed=self._initial_seed)
+    
     # Compile physical engine
     self._compile()
     
@@ -106,10 +109,11 @@ class Universe():
       raise FileNotFoundError(f"{str(input_path)} doesn't exist.")
 
     with h5py.File(str(input_path), "r") as f:
-      u = cls(N=f['particles'].attrs['N'],
-              L=f['geometry']['channel'].attrs['L'],
-              h=f['geometry']['channel'].attrs['h'],
-              R=f['geometry']['reservoir'].attrs['R'],
+      top_name = f['geometry']['name']
+      top_class = topology._topologyDic[top_name]
+
+      u = cls(top=top_class.from_hdf5(f['geometry']),
+              N=f['particles'].attrs['N'],
               D=f['particles']['0'].attrs['D'],
               dt=f.attrs['dt'],
               output_path=input_path,
@@ -235,7 +239,7 @@ class Universe():
       f.attrs['dt'] = self.dt
       f.attrs['dtype'] = self._dtype
       f.attrs['ndim'] = 2 # Specify that it is a 2D simulation
-      f.create_group
+
       particlesgrp = f.create_group('particles')
       particlesgrp.attrs['N'] = self.N # Specify total number of particles
       particlesgrp.attrs['_seed'] = self._initial_seed
@@ -247,69 +251,24 @@ class Universe():
 
       # Create a group holding informations about geometry
       geomgrp = f.create_group("geometry")
-      Rgrp = geomgrp.create_group("reservoir")
-      Rgrp.attrs['R'] = self.R
-      Rgrp.attrs['bc_bulk'] = 'elastic simplified'
-      Rgrp.attrs['bc_membrane'] = 'elastic'
-
-      Cgrp = geomgrp.create_group("channel")
-      Cgrp.attrs['L'], Cgrp.attrs['h'] = self.L, self.h
-      Cgrp.attrs['bc'] = 'elastic'
+      self._top.to_hdf5(geomgrp)
 
       # Create a group that will hold informations about simulations
       rungrp = f.create_group("run")
       rungrp.attrs['N_runs'] = 0  # number of simulation perfomed until now
 
-  def _fillGeometry(self):
-    """Randomly fill the geometry
-    """
-    # Get geometry parameters
-    L, h, R = self.L, self.h, self.R
-    # Get number of particles
-    N = self.N
-    # Surface of reservoirs
-    S_R = R**2
-    # Surface of the channel
-    S_c = h*L
-
-    # Put particles in reservoirs
-    N_R = int(np.ceil(N*S_R/(S_R+S_c)))
-    r0_R = np.random.uniform(-R, R, size=(N_R, 2))
-
-    r0_R[np.where(r0_R[:, 0] < 0), 0] -= L/2
-    r0_R[np.where(r0_R[:, 0] >= 0), 0] += L/2
-
-    # Number of particles in channel
-    N_c = N-N_R
-    if N_c > 0:
-      r0_c = np.stack((np.random.uniform(-L/2, L/2, size=(N_c)),
-                        np.random.uniform(-h/2, h/2, size=(N_c)))).T
-      r0 = np.concatenate((r0_R, r0_c))
-    else:
-      r0 = r0_R
-
-    return r0.astype(self._dtype)
-
   def _compile(self):
-    """Compile cuda function
+    """Compile kernel cuda function
     """
-    ## Following parameters are treated as constants during the compilation
-    ## It is faster than putting them as parameters for engine function #TODO IDK why
-    # Get geometry parameters
-    L, h, R = self.L, self.h, self.R
-    # Maximum bounce during one step
-    # It may happen that the elastic bounce of a particle lead it to another wall 
-    MAX_BOUNCE = self.MAX_BOUNCE
-    MAX_BOUNCE = 1
-    # Get number of thread per block and compute the number of block necessary to 
-    # account for all particles
+    compute_boundary_condition = self._top.compute_boundary_condition
+    check_region = self._top.check_region
+
     threadsperblock = self._threadsperblock
     if self.N % threadsperblock != 0:
       RuntimeWarning(
         f"""The number of particles should be a multiple of {threadsperblock} 
         for optimal performance""") #TODO : check if everyting work in this case
     blockspergrid = math.ceil(self.N / threadsperblock)
-    dtype = self._dtype
 
     # @cuda.jit(f'void({dtype}[:,:], uint64)')
     @cuda.jit
@@ -340,176 +299,8 @@ class Universe():
           x1 = x0 + dx
           z1 = z0 + dz
 
-          toCheck = True
-          i_BOUNCE = 0
-          while toCheck and i_BOUNCE < MAX_BOUNCE:
-            toCheck = False
-            if i_BOUNCE > 4:
-              # print(x1, z1)
-              x1 = (x0+x1)/2
-              z1 = (z0+z1)/2
-            # Left part
-            if (x1 < -L/2):
-              if (x1<-R-L/2):
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             -R-L/2, 0,
-                                             1, 0)
-                toCheck = True
-              elif z1 > h/2 and x0 > -L/2:
-                t = (z0-h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = h/2
-                if xint > -L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-              elif z1 < -h/2 and x0 > -L/2:
-                
-                t = (z0+h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = -h/2
-
-                if xint > -L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            # Right part
-            elif (x1 > +L/2):
-              if (x1>+R+L/2):
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             +R+L/2, 0,
-                                             1, 0)
-                toCheck = True
-              elif z1 > h/2 and x0 < +L/2:
-                t = (z0-h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = h/2
-                if xint < +L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-              elif z1 < -h/2 and x0 < +L/2:
-                t = (z0+h/2)/(z0-z1)
-                xint = t*x1 + (1-t)*x0
-                zint = -h/2
-                if xint < +L/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            # Middle part
-            else:
-              if x0 < -L/2 and x1 > -L/2:
-                # if step>=473580 and pos == 438:
-                #   print('To middle part')
-                #   print(x0+L/2, x0-x1)
-                #   print((x0+L/2)/(x0-x1))
-                #   print('bla')
-                # Intersection with x=-L/2
-                t = (x0+L/2)/(x0-x1)
-                xint = -L/2
-                zint = t*z1 + (1-t)*z0
-                if math.fabs(zint) > h/2:
-                  # if step>=473580 and pos == 438:
-                  #   x0,x1 = nb.float32(x0), nb.float32(x1)
-                  #   z0,z1 = nb.float32(z0), nb.float32(z1)
-                  #   print('bla2')
-                  #   NX, NZ = nb.float32(1), nb.float32(0)
-                  #   X, Z = nb.float32(-L/2), nb.float32(0)
-                  #   t = (NX*(x0-X) + NZ*(z0-Z))/(NX*(x0-x1) + NZ*(z0-z1))
-                  #   print(t)
-                  #   x_int = x1*t + x0*(1-t)
-                  #   z_int = z1*t + z0*(1-t)
-                  #   print(x_int, z_int)
-                  #   # Finding reflection
-                  #   x_1_int, z_1_int = x1-x_int, z1-z_int
-                  #   print(x_1_int, z_1_int)
-                  #   n_1_int = math.sqrt((x_1_int)**2 + (z_1_int)**2)
-                  #   print(n_1_int)
-                  #   ux_1_int, uz_1_int = x_1_int/n_1_int, z_1_int/n_1_int
-                  #   print(ux_1_int, uz_1_int)
-                  #   ps = (ux_1_int*NX + uz_1_int*NZ) # scalar product between n and u_1_int
-                  #   print(ps)
-                  #   x1p = x_int + n_1_int*(ux_1_int - 2*ps*NX)
-                  #   z1p = z_int + n_1_int*(uz_1_int - 2*ps*NZ)
-                  #   print(x1p, z1p)
-                  #   # print()
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                -L/2, 0,
-                                                1, 0)
-                  # if step>=473580 and pos == 438:
-                  #   print(x1, z1)
-                  #   print('bla3')
-
-                  toCheck = True
-                else:
-                  if z1 > h/2:
-                    x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                  x1, z1,
-                                                  0, h/2,
-                                                  0, 1)
-                    toCheck = True
-                  elif z1 < -h/2:
-                    
-                    x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                  x1, z1,
-                                                  0, -h/2,
-                                                  0, 1)
-                    toCheck = True
-              elif x0 > L/2 and x1 < L/2:
-                  # Intersection with x=+L/2
-                  t = (x0-L/2)/(x0-x1)
-                  xint = +L/2
-                  zint = t*z1 + (1-t)*z0
-                  if math.fabs(zint) > h/2:
-                      x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                    x1, z1,
-                                                    +L/2, 0,
-                                                    1, 0)
-                      toCheck = True
-                  else:
-                      if z1 > h/2:
-                          x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                        x1, z1,
-                                                        0, h/2,
-                                                        0, 1)
-                          toCheck = True
-                      elif z1 < -h/2:
-                          x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                        x1, z1,
-                                                        0, -h/2,
-                                                        0, 1)
-                          toCheck = True
-              else:  # x0 and x1 inside the channel
-                if z1 > h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, h/2,
-                                                0, 1)
-                  toCheck = True
-                elif z1 < -h/2:
-                  x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                                x1, z1,
-                                                0, -h/2,
-                                                0, 1)
-                  toCheck = True
-            i_BOUNCE += 1
-            # toCheck=False
-          # Periodic boundary condition along z:
-          z1 = (R - z1)%(2*R) - R
-
-          if x1 <= -L/2:
-            cuda.atomic.add(inside, step, 1)
+          compute_boundary_condition(x0, z0, x1, z1, 0)
+          check_region(x1, z1, inside, step)
 
           x0 = x1
           z0 = z1
@@ -573,13 +364,13 @@ class Universe():
       while f'{i}' in runsgrp:
           i += 1
       rungrp = runsgrp.create_group(f'{i}')
-      rungrp.status = 'UNCOMPLETED'
-      rungrp.step_i = self._step
-      rungrp.step_f = self._step + N_steps
+      rungrp.attrs['status'] = 'UNCOMPLETED'
+      rungrp.attrs['step_i'] = self._step
+      rungrp.attrs['step_f'] = self._step + N_steps
       
       region_0_ds = rungrp.create_dataset('region_0', dtype=np.uint16, 
-                                            shape=(N_steps),
-                                            chunks=(max_chunk_size))
+                                            shape=(N_steps,),
+                                            chunks=(max_chunk_size,))
       region_0_ds.attrs['definition'] = 'x<=L/2'
 
       freq_dumps = nb.uint32(freq_dumps)
