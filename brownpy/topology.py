@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 import numba as nb
 import numpy as np
 from numba import cuda
-from numpy import float32, ndarray, uint, uint32
+from numpy import array, float32, ndarray, uint, uint32
 
 from brownpy import bc
 import h5py
@@ -34,7 +34,8 @@ class Topology(ABC):
   @abstractmethod
   def compute_boundary_condition(self, 
                                  x0:dtype, z0:dtype, 
-                                 x1:dtype, z1:dtype, 
+                                 x1:dtype, z1:dtype,
+                                 rng_states:array, 
                                  internal_state:uint32):
     raise NotImplementedError
 
@@ -56,9 +57,10 @@ class ElasticChannel1(Topology):
     self.R = R
     
     ## Geometrical parameters are treated as constants during the compilation
-    @cuda.jit(device=True)
+    @cuda.jit(device=True, inline=True)
     def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype, 
+                                   x1:dtype, z1:dtype,
+                                   rng_states:array,
                                    internal_state:uint32):
       pos = cuda.grid(1)
       toCheck = True
@@ -208,7 +210,8 @@ class ElasticChannel1(Topology):
   
   def compute_boundary_condition(self, 
                                  x0:dtype, z0:dtype, 
-                                 x1:dtype, z1:dtype, 
+                                 x1:dtype, z1:dtype,
+                                 rng_states:array, 
                                  internal_state:uint32):
     raise NotImplementedError
 

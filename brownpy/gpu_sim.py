@@ -12,10 +12,12 @@ from numba.cuda.random import (create_xoroshiro128p_states,
                                xoroshiro128p_normal_float32)
 from numpy.random.mtrand import seed
 from tqdm.auto import tqdm
+import cupy as cp
 
 from brownpy import bc
 from brownpy import topology
 from brownpy.utils import prefix
+from brownpy.utils import set_cuda_array
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
 
@@ -35,7 +37,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.0.5a'
+  __version__ = '0.0.6a'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -298,7 +300,7 @@ class Universe():
           x1 = x0 + dx
           z1 = z0 + dz
 
-          x1, z1 = compute_boundary_condition(x0, z0, x1, z1, 0)
+          x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, 0)
           check_region(x1, z1, inside, step)
 
           x0 = x1
@@ -403,9 +405,7 @@ class Universe():
       # TODO : use pinned array ?
       
       # Allocate device memory to store number of particle in region 0
-
-      p_inside = cuda.pinned_array(max_chunk_size, np.uint32)
-      d_inside = cuda.to_device(inside) # Transfert to device memory
+      p_inside = cp.zeros(max_chunk_size, dtype=np.uint32)
 
       # Allocate memory to store trajectory
       N_dumps = 0 if freq_dumps==0 else math.floor(max_chunk_size/freq_dumps)
@@ -430,13 +430,15 @@ class Universe():
         chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
 
         e0.record()
+        p_inside=cp.zeros(max_chunk_size, dtype=np.uint32)
         e1.record()
+
         self.engine[self._blockspergrid, 
                     self._threadsperblock](d_pos, # r0
                                            self._step, # t0 
                                            chunk_size, # N_steps 
                                            scale, # sig
-                                           d_inside, # inside 
+                                           p_inside, # inside 
                                            rng_states, # rng_states
                                            d_trajectory, # trajectory
                                            freq_dumps #freq_dumps
@@ -445,13 +447,12 @@ class Universe():
         e2.record()
         # Transfert results from device to RAM
         # TODO : USE STREAM !!!
-        d_inside.copy_to_host(inside) 
         if freq_dumps!=0: d_trajectory.copy_to_host(trajectory)
-        e3.record()
+        
 
         t1_cpu = time.perf_counter()
         # Transfert result from RAM to drive
-        region_0_ds[i_step:i_step + max_chunk_size] = inside[:chunk_size] # Transfert result from RAM to drive
+        region_0_ds[i_step:i_step + max_chunk_size] = p_inside.get()[:chunk_size] # Transfert result from RAM to drive
         if freq_dumps!=0:
           i_N_dumps = math.floor(chunk_size/freq_dumps)
           traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
@@ -459,6 +460,7 @@ class Universe():
         self._step += chunk_size
 
         t2_cpu = time.perf_counter()
+        e3.record()
         cuda.synchronize()
         dt1.append(cuda.event_elapsed_time(e0,e1)*1E-3)
         dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
@@ -485,8 +487,8 @@ class Universe():
     print(f'------------------------------------------')
     print(f'For a timestep of {prefix(dt*1E-15)}s')
     print(f'To simulate the trajectory of 1 particle during 1 s, we need {prefix(((dt1_cpu+dt2_cpu)/N_steps/N_particles)*(1E15/dt))}s')
-    del d_trajectory, d_inside, d_pos
-    del trajectory, inside
+    del d_trajectory, d_pos
+    del trajectory
     # return True
 
 
