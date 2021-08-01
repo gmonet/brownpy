@@ -60,6 +60,7 @@ class ElasticChannel1(Topology):
     def compute_boundary_condition(x0:dtype, z0:dtype, 
                                    x1:dtype, z1:dtype, 
                                    internal_state:uint32):
+      pos = cuda.grid(1)
       toCheck = True
       i_BOUNCE = 0
       while toCheck and i_BOUNCE < MAX_BOUNCE:
@@ -189,9 +190,11 @@ class ElasticChannel1(Topology):
                                            0, 1)
               toCheck = True
         i_BOUNCE += 1
-      
+        # if i_BOUNCE>=MAX_BOUNCE-2:
+        #   print(pos, i_BOUNCE, x0, z0, x1, z1)
+      return x1, z1
       # Periodic boundary condition along z:
-      z1 = (R - z1)%(2*R) - R
+      # z1 = (R - z1)%(2*R) - R
     self.compute_boundary_condition = compute_boundary_condition
 
     @cuda.jit(device=True)

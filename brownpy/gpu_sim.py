@@ -35,7 +35,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.0.2a'
+  __version__ = '0.0.5a'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -80,6 +80,11 @@ class Universe():
 
     # Thread per block (128 by default)
     self._threadsperblock = kwargs.get('threadsperblock', 128)
+    if self.N % self._threadsperblock != 0:
+      RuntimeWarning(
+        f"""The number of particles should be a multiple of {self._threadsperblock} 
+        for optimal performance""") #TODO : check if everyting work in this case
+    self._blockspergrid = math.ceil(self._N / self._threadsperblock)
 
     # Set seed if defined by user or use the system clock as seed
     self._initial_seed = kwargs.get('seed', time.time_ns())
@@ -263,13 +268,6 @@ class Universe():
     compute_boundary_condition = self._top.compute_boundary_condition
     check_region = self._top.check_region
 
-    threadsperblock = self._threadsperblock
-    if self.N % threadsperblock != 0:
-      RuntimeWarning(
-        f"""The number of particles should be a multiple of {threadsperblock} 
-        for optimal performance""") #TODO : check if everyting work in this case
-    blockspergrid = math.ceil(self.N / threadsperblock)
-
     # @cuda.jit(f'void({dtype}[:,:], uint64)')
     @cuda.jit
     def engine(r0, t0, N_steps, sig, inside, rng_states, trajectory, freq_dumps):
@@ -289,7 +287,8 @@ class Universe():
 
       pos = cuda.grid(1)
       dx, dz = nb.float32(0.0), nb.float32(0.0)
-      if pos < r0.shape[0]:  
+
+      if pos < r0.shape[0]:
         x0, z0 = r0[pos, 0], r0[pos, 1]
         i_dump = 0 
         for step in range(N_steps):
@@ -299,7 +298,7 @@ class Universe():
           x1 = x0 + dx
           z1 = z0 + dz
 
-          compute_boundary_condition(x0, z0, x1, z1, 0)
+          x1, z1 = compute_boundary_condition(x0, z0, x1, z1, 0)
           check_region(x1, z1, inside, step)
 
           x0 = x1
@@ -314,7 +313,7 @@ class Universe():
       if pos==0:
         t0 += N_steps
         
-    self.engine = engine[blockspergrid, threadsperblock]
+    self.engine = engine
 
   def plotPosition(self, s=0.1, **fig_kwargs):
     """Plot current position of particles
@@ -355,7 +354,9 @@ class Universe():
       s (float, optional): size of scatter. Default to 0.1
       fig_kwargs (optional): Paramter to pass to plt.subplots
     """
-    max_chunk_size = 100_000 # TODO : dask ???
+    
+
+    max_chunk_size = min(N_steps, 100_000) # TODO : dask ???
 
     with h5py.File(self._output_path, 'a') as f:
       runsgrp = f['run']
@@ -399,6 +400,17 @@ class Universe():
 
       # Transfert current position to device
       d_pos = cuda.to_device(self._pos)
+      # TODO : use pinned array ?
+      
+      # Allocate device memory to store number of particle in region 0
+
+      p_inside = cuda.pinned_array(max_chunk_size, np.uint32)
+      d_inside = cuda.to_device(inside) # Transfert to device memory
+
+      # Allocate memory to store trajectory
+      N_dumps = 0 if freq_dumps==0 else math.floor(max_chunk_size/freq_dumps)
+      trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
+      d_trajectory = cuda.to_device(trajectory) # Transfert to device memory
 
       # Create individual random generator states for each CUDA thread 
       # Note: max independant number generation : 2**64 (1.8E19)
@@ -407,6 +419,8 @@ class Universe():
 
       # i_step = self._step 
       e0, e1, e2, e3 = cuda.event(), cuda.event(), cuda.event(), cuda.event()
+      # transfertStream1 = cuda.stream()
+      # transfertStream2 = cuda.stream()
       dt1, dt2, dt3 = [], [], []
       dt1_cpu, dt2_cpu = [], []
       pbar = tqdm(total=math.ceil(N_steps))
@@ -415,38 +429,32 @@ class Universe():
         chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
         chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
 
-        # Allocate device memory to store number of particle in region 0
         e0.record()
-        i_inside = np.zeros(chunk_size, np.uint32)
-        d_i_inside = cuda.to_device(i_inside) # Transfert to device memory
-
-        # Allocate memory to store trajectory
-        i_N_dumps = 0 if freq_dumps==0 else math.floor(chunk_size/freq_dumps)
-        i_trajectory = np.zeros((N_particles, 2, i_N_dumps), dtype=np.float32)
-        d_i_trajectory = cuda.to_device(i_trajectory) # Transfert to device memory
-
         e1.record()
-        self.engine(d_pos, # r0
-                    self._step, # t0 
-                    chunk_size, # N_steps 
-                    scale, # sig
-                    d_i_inside, # inside 
-                    rng_states, # rng_states
-                    d_i_trajectory, # trajectory
-                    freq_dumps #freq_dumps
-                    )
+        self.engine[self._blockspergrid, 
+                    self._threadsperblock](d_pos, # r0
+                                           self._step, # t0 
+                                           chunk_size, # N_steps 
+                                           scale, # sig
+                                           d_inside, # inside 
+                                           rng_states, # rng_states
+                                           d_trajectory, # trajectory
+                                           freq_dumps #freq_dumps
+                                           )
 
         e2.record()
         # Transfert results from device to RAM
-        d_i_inside.copy_to_host(i_inside) 
-        if freq_dumps!=0: d_i_trajectory.copy_to_host(i_trajectory)
+        # TODO : USE STREAM !!!
+        d_inside.copy_to_host(inside) 
+        if freq_dumps!=0: d_trajectory.copy_to_host(trajectory)
         e3.record()
 
         t1_cpu = time.perf_counter()
         # Transfert result from RAM to drive
-        region_0_ds[i_step:i_step + max_chunk_size] = i_inside # Transfert result from RAM to drive
+        region_0_ds[i_step:i_step + max_chunk_size] = inside[:chunk_size] # Transfert result from RAM to drive
         if freq_dumps!=0:
-          traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = i_trajectory
+          i_N_dumps = math.floor(chunk_size/freq_dumps)
+          traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
 
         self._step += chunk_size
 
@@ -464,19 +472,21 @@ class Universe():
     dt1_cpu, dt2_cpu = np.mean(dt1_cpu), np.mean(dt2_cpu)
     print(f'With {N_particles} particles')
     print(f'------------------------------------------')
-    print(f'GPU time per step:')
-    print(f'Allocation: {prefix(dt1/N_steps)}s')
-    print(f'Engine: {prefix(dt2/N_steps)}s')
-    print(f'Transfert to RAM: {prefix(dt3/N_steps)}s')
-    print(f'Total: {prefix((dt1+dt2+dt3)/N_steps)}s')
+    print(f'GPU time per step and per particles:')
+    print(f'Allocation: {prefix(dt1/N_steps/N_particles)}s')
+    print(f'Engine: {prefix(dt2/N_steps/N_particles)}s')
+    print(f'Transfert to RAM: {prefix(dt3/N_steps/N_particles)}s')
+    print(f'Total: {prefix((dt1+dt2+dt3)/N_steps/N_particles)}s')
     print(f'------------------------------------------')
-    print(f'CPU time per step:')
-    print(f'Other: {prefix(dt1_cpu/N_steps)}s')
-    print(f'Transfert to drive: {prefix(dt2_cpu/N_steps)}s')
-    print(f'Total: {prefix((dt1_cpu+dt2_cpu)/N_steps)}s')
-
-    del d_i_trajectory, d_i_inside, d_pos
-    del i_trajectory, i_inside
+    print(f'CPU time per step and per particles:')
+    print(f'Other: {prefix(dt1_cpu/N_steps/N_particles)}s')
+    print(f'Transfert to drive: {prefix(dt2_cpu/N_steps/N_particles)}s')
+    print(f'Total: {prefix((dt1_cpu+dt2_cpu)/N_steps/N_particles)}s')
+    print(f'------------------------------------------')
+    print(f'For a timestep of {prefix(dt*1E-15)}s')
+    print(f'To simulate the trajectory of 1 particle during 1 s, we need {prefix(((dt1_cpu+dt2_cpu)/N_steps/N_particles)*(1E15/dt))}s')
+    del d_trajectory, d_inside, d_pos
+    del trajectory, inside
     # return True
 
 
