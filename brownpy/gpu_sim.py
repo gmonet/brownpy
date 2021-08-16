@@ -317,35 +317,22 @@ class Universe():
         
     self.engine = engine
 
-  def plotPosition(self, s=0.1, **fig_kwargs):
+  def plot_pos(self, s=0.1, **fig_kwargs):
     """Plot current position of particles
 
     Args:
       s (float, optional): size of scatter. Default to 0.1
       fig_kwargs (optional): Paramter to pass to plt.subplots
     """
-    L, h, R = self.L, self.h, self.R
     # Get current position
     pos = self.pos
     fig, ax = plt.subplots(**fig_kwargs)
-    border_kwargs = {'c': 'r'}
     # Draw particles as scatter
     ax.scatter(pos[:, 0], pos[:, 1], s)
+    
     # Draw geometry
-
-    ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
-    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
-
-    ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
-    ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
-    ax.plot([-L/2, +L/2], [h/2, h/2], **border_kwargs)
-    ax.plot([-L/2, +L/2], [-h/2, -h/2], **border_kwargs)
-    ax.plot([-L/2, -L/2], [-R, -h/2], **border_kwargs)
-    ax.plot([+L/2, +L/2], [-R, -h/2], **border_kwargs)
-    ax.set_xlabel('x [Å]')
-    ax.set_ylabel('y [Å]')
-    ax.set_aspect('equal')
-    ax.set_aspect('equal')
+    top = self._top
+    top.plot(ax)
 
     return fig, ax
 

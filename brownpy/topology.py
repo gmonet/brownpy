@@ -1,13 +1,15 @@
 
 import math
 from abc import ABC, abstractmethod
+
+import h5py
+import matplotlib.pyplot as plt
 import numba as nb
 import numpy as np
 from numba import cuda
 from numpy import array, float32, ndarray, uint, uint32
 
 from brownpy import bc
-import h5py
 
 dtype=float32
 
@@ -48,6 +50,10 @@ class Topology(ABC):
 
   @abstractmethod
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
+    raise NotImplementedError
+  
+  @abstractmethod
+  def plot(self, ax=None):
     raise NotImplementedError
 
 class ElasticChannel1(Topology):
@@ -194,9 +200,11 @@ class ElasticChannel1(Topology):
         i_BOUNCE += 1
         # if i_BOUNCE>=MAX_BOUNCE-2:
         #   print(pos, i_BOUNCE, x0, z0, x1, z1)
-      return x1, z1
+      
       # Periodic boundary condition along z:
-      # z1 = (R - z1)%(2*R) - R
+      z1 = (R - z1)%(2*R) - R
+
+      return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
     @cuda.jit(device=True)
@@ -267,4 +275,30 @@ class ElasticChannel1(Topology):
 
     return r0.astype(dtype)
 
+  def plot(self, ax=None):
+    if ax is None:
+      fig, ax = plt.subplots()
+    fig = ax.get_figure()
+
+    L, h, R = self.L, self.h, self.R
+
+    border_kwargs = {'c': 'r'}
+
+    # Draw geometry
+
+    ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
+    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
+
+    ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
+    ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
+    ax.plot([-L/2, +L/2], [h/2, h/2], **border_kwargs)
+    ax.plot([-L/2, +L/2], [-h/2, -h/2], **border_kwargs)
+    ax.plot([-L/2, -L/2], [-R, -h/2], **border_kwargs)
+    ax.plot([+L/2, +L/2], [-R, -h/2], **border_kwargs)
+    ax.set_xlabel('x [Å]')
+    ax.set_ylabel('y [Å]')
+    ax.set_aspect('equal')
+    ax.set_aspect('equal')
+    return fig, ax
+    
 _topologyDic = {ElasticChannel1.__name__: ElasticChannel1}
