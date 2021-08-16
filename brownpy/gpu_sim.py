@@ -36,7 +36,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.0.6a'
+  __version__ = '0.0.7a'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -292,6 +292,7 @@ class Universe():
       if pos < r0.shape[0]:
         x0, z0 = r0[pos, 0], r0[pos, 1]
         i_dump = 0 
+        internal_state= cuda.local.array(1, nb.uint32)
         for step in range(N_steps):
 
           dx = sig*xoroshiro128p_normal_float32(rng_states, pos)
@@ -299,7 +300,7 @@ class Universe():
           x1 = x0 + dx
           z1 = z0 + dz
 
-          x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, 0)
+          x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, internal_state)
           check_region(x1, z1, inside, step)
 
           x0 = x1
