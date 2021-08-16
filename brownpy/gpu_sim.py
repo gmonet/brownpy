@@ -17,7 +17,6 @@ import cupy as cp
 from brownpy import bc
 from brownpy import topology
 from brownpy.utils import prefix
-from brownpy.utils import set_cuda_array
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
 
