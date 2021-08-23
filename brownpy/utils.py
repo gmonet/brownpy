@@ -1,4 +1,5 @@
 import math
+import numpy as np
 
 def prefix(x, dimension=1):
     """Give the number an appropriate SI prefix.
@@ -14,3 +15,10 @@ def prefix(x, dimension=1):
 
     div, mod = divmod(l, 3*dimension)
     return "%.3g %s" % (x * 10**(-l + mod), " kMGTPEZYyzafpnµm"[div])
+
+def unwrap(x, period):
+    shiftx = np.zeros_like(x)
+    shiftx[np.where(np.diff(x)> period/2)[0]+1] -= period
+    shiftx[np.where(np.diff(x)<-period/2)[0]+1] += period
+    shiftx = np.cumsum(shiftx)
+    return x+shiftx
