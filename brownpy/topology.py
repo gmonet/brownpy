@@ -1,6 +1,7 @@
 
 import math
 from abc import ABC, abstractmethod
+import textwrap
 
 import h5py
 import matplotlib.pyplot as plt
@@ -18,7 +19,38 @@ dtype=float32
 # It may happen that the elastic bounce of a particle lead it to another wall    
 MAX_BOUNCE = 4
 
+  
 class Topology(ABC):
+  def compile_check_region(regions):
+    '''
+    Create device CUDA function from defined regions
+    Args:
+      regions (list of dict): Each input must be dictionnary with, at least,
+        a 'name' and 'def' keys.
+    Returns:
+      check_region (cuda device function)
+    '''
+    code_check_region = f'''
+    @cuda.jit(device=True)
+    def check_region(x:nb.types.float32, z:nb.types.float32,
+                      inside:nb.types.Array, 
+                      step:nb.types.uint64, 
+                      internal_state:tuple) -> None:
+    '''
+    for i, region in enumerate(regions):
+      code_check_region+=f'''
+      if {region['def']}:
+        cuda.atomic.add(inside, ({i}, step), 1)
+      '''
+    code_check_region = textwrap.dedent(code_check_region)
+    return_dict={}
+    exec(code_check_region, globals(), return_dict)
+    return return_dict['check_region']
+  # @property
+  # def regions(self):
+  #   '''Regions from which the number of particles is recorded'''
+  #   raise NotImplementedError
+
   @abstractmethod
   def fill_geometry(self, N: uint):
     """Randomly fill the geometry
@@ -46,7 +78,8 @@ class Topology(ABC):
   def check_region(self,
                    x:dtype, z:dtype,
                    inside:nb.types.Array, 
-                   step:nb.types.uint64) -> None:
+                   step:nb.types.uint64, 
+                   internal_state:tuple) -> None:
     raise NotImplementedError
 
   @abstractmethod
@@ -56,256 +89,9 @@ class Topology(ABC):
   @abstractmethod
   def plot(self, ax=None):
     raise NotImplementedError
-
-class ElasticChannelOld(Topology):
-  __version__='0.0.1'
-  def __init__(self, L: dtype, h: dtype, R: dtype, **kwargs) -> None:
-    self.L = L
-    self.h = h
-    self.R = R
-    
-    ## Geometrical parameters are treated as constants during the compilation
-    @cuda.jit(device=True, inline=True)
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
-      pos = cuda.grid(1)
-      toCheck = True
-      i_BOUNCE = 0
-      while toCheck and i_BOUNCE < MAX_BOUNCE:
-        toCheck = False
-        if i_BOUNCE > 4:
-          x1 = (x0+x1)/2
-          z1 = (z0+z1)/2
-        # Left part
-        if (x1 < -L/2):
-          if (x1 < -R-L/2):
-            x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                         x1, z1,
-                                         -R-L/2, 0,
-                                         1, 0)
-            toCheck = True
-          elif z1 > h/2 and x0 > -L/2:
-            t = (z0-h/2)/(z0-z1)
-            xint = t*x1 + (1-t)*x0
-            zint = h/2
-            if xint > -L/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           0, h/2,
-                                           0, 1)
-              toCheck = True
-          elif z1 < -h/2 and x0 > -L/2:
-
-            t = (z0+h/2)/(z0-z1)
-            xint = t*x1 + (1-t)*x0
-            zint = -h/2
-
-            if xint > -L/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           0, -h/2,
-                                           0, 1)
-              toCheck = True
-        # Right part
-        elif (x1 > +L/2):
-          if (x1 > +R+L/2):
-            x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                         x1, z1,
-                                         +R+L/2, 0,
-                                         1, 0)
-            toCheck = True
-          elif z1 > h/2 and x0 < +L/2:
-            t = (z0-h/2)/(z0-z1)
-            xint = t*x1 + (1-t)*x0
-            zint = h/2
-            if xint < +L/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           0, h/2,
-                                           0, 1)
-              toCheck = True
-          elif z1 < -h/2 and x0 < +L/2:
-            t = (z0+h/2)/(z0-z1)
-            xint = t*x1 + (1-t)*x0
-            zint = -h/2
-            if xint < +L/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           0, -h/2,
-                                           0, 1)
-              toCheck = True
-        # Middle part
-        else:
-          if x0 < -L/2 and x1 > -L/2:
-            t = (x0+L/2)/(x0-x1)
-            xint = -L/2
-            zint = t*z1 + (1-t)*z0
-            if math.fabs(zint) > h/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           -L/2, 0,
-                                           1, 0)
-              toCheck = True
-            else:
-              if z1 > h/2:
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             0, h/2,
-                                             0, 1)
-                toCheck = True
-              elif z1 < -h/2:
-
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             0, -h/2,
-                                             0, 1)
-                toCheck = True
-          elif x0 > L/2 and x1 < L/2:
-              # Intersection with x=+L/2
-            t = (x0-L/2)/(x0-x1)
-            xint = +L/2
-            zint = t*z1 + (1-t)*z0
-            if math.fabs(zint) > h/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           +L/2, 0,
-                                           1, 0)
-              toCheck = True
-            else:
-              if z1 > h/2:
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             0, h/2,
-                                             0, 1)
-                toCheck = True
-              elif z1 < -h/2:
-                x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                             x1, z1,
-                                             0, -h/2,
-                                             0, 1)
-                toCheck = True
-          else:  # x0 and x1 inside the channel
-            if z1 > h/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           0, h/2,
-                                           0, 1)
-              toCheck = True
-            elif z1 < -h/2:
-              x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                           x1, z1,
-                                           0, -h/2,
-                                           0, 1)
-              toCheck = True
-        i_BOUNCE += 1
-        # if i_BOUNCE>=MAX_BOUNCE-2:
-        #   print(pos, i_BOUNCE, x0, z0, x1, z1)
-      
-      # Periodic boundary condition along z:
-      z1 = (R - z1)%(2*R) - R
-
-      return x1, z1
-    self.compute_boundary_condition = compute_boundary_condition
-
-    @cuda.jit(device=True)
-    def check_region(x:dtype, z:dtype,
-                     inside:nb.types.Array, 
-                     step:nb.types.uint64) -> None:
-        if(x<=0):
-          cuda.atomic.add(inside, (step), 1)
-
-    self.check_region = check_region
-  
-  def compute_boundary_condition(self, 
-                                 x0:dtype, z0:dtype, 
-                                 x1:dtype, z1:dtype,
-                                 rng_states:array, 
-                                 internal_state:tuple):
-    raise NotImplementedError
-
-  def check_region(self,
-                   x:dtype, z:dtype,
-                   inside:nb.types.Array, 
-                   step:nb.types.uint64) -> None:
-    raise NotImplementedError
-
-  def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = ElasticChannelOld.__name__
-    geom_grp['version'] = ElasticChannelOld.__version__
-    Rgrp = geom_grp.create_group("reservoir")
-    Rgrp.attrs['R'] = self.R
-    Rgrp.attrs['bc_x'] = 'elastic'
-    Rgrp.attrs['bc_z'] = 'periodic'
-    Rgrp.attrs['bc_x_membrane'] = 'elastic'
-
-    Cgrp = geom_grp.create_group("channel")
-    Cgrp.attrs['L'], Cgrp.attrs['h'] = self.L, self.h
-    Cgrp.attrs['bc'] = 'elastic'
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(L=geom_grp['channel'].attrs['L'],
-              h=geom_grp['channel'].attrs['h'],
-              R=geom_grp['reservoir'].attrs['R'])
-
-  def fill_geometry(self, N: uint, seed=None) -> ndarray:
-    rng = np.random.default_rng(seed)
-
-    # Get geometry parameters
-    L, h, R = self.L, self.h, self.R
-    # Surface of reservoirs
-    S_R = R**2
-    # Surface of the channel
-    S_c = h*L
-
-    # Put particles in reservoirs
-    N_R = int(np.ceil(N*S_R/(S_R+S_c)))
-    r0_R = rng.uniform(-R, R, size=(N_R, 2))
-
-    r0_R[np.where(r0_R[:, 0] < 0), 0] -= L/2
-    r0_R[np.where(r0_R[:, 0] >= 0), 0] += L/2
-
-    # Number of particles in channel
-    N_c = N-N_R
-    if N_c > 0:
-      r0_c = np.stack((rng.uniform(-L/2, L/2, size=(N_c)),
-                       rng.uniform(-h/2, h/2, size=(N_c)))).T
-      r0 = np.concatenate((r0_R, r0_c))
-    else:
-      r0 = r0_R
-
-    return r0.astype(dtype)
-
-  def plot(self, ax=None):
-    if ax is None:
-      fig, ax = plt.subplots()
-    fig = ax.get_figure()
-
-    L, h, R = self.L, self.h, self.R
-
-    border_kwargs = {'c': 'r'}
-
-    # Draw geometry
-
-    ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
-    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
-
-    ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
-    ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
-    ax.plot([-L/2, +L/2], [h/2, h/2], **border_kwargs)
-    ax.plot([-L/2, +L/2], [-h/2, -h/2], **border_kwargs)
-    ax.plot([-L/2, -L/2], [-R, -h/2], **border_kwargs)
-    ax.plot([+L/2, +L/2], [-R, -h/2], **border_kwargs)
-    ax.set_xlabel('x [Å]')
-    ax.set_ylabel('y [Å]')
-    ax.set_aspect('equal')
-    ax.set_aspect('equal')
-    return fig, ax
 
 class ElasticPore1(Topology):
-  __version__='0.0.1'
+  __version__='0.0.2'
   def __init__(self, Lm: dtype, L: dtype, R: dtype, **kwargs) -> None:
     """Simple elastic Pore
     Geometry inspired from Marbach 2020
@@ -333,6 +119,11 @@ class ElasticPore1(Topology):
     self.Lm = Lm
     self.L = L
     self.R = R
+    regions = [{'name':'left', 'def':'x<=0'}]
+    self.regions = regions
+
+    for region in self.regions:
+        region['_lambda'] = cuda.jit(device=True)(eval(f'lambda x, z: {region["def"]}'))
 
     ## Geometrical parameters are treated as constants during the compilation
     @cuda.jit(device=True, inline=True)
@@ -368,14 +159,7 @@ class ElasticPore1(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    @cuda.jit(device=True)
-    def check_region(x:dtype, z:dtype,
-                     inside:nb.types.Array, 
-                     step:nb.types.uint64) -> None:
-        if(x<=0):
-          cuda.atomic.add(inside, (step), 1)
-
-    self.check_region = check_region
+    self.check_region = Topology.compile_check_region(regions)
   
   def compute_boundary_condition(self, 
                                  x0:dtype, z0:dtype, 
@@ -387,7 +171,8 @@ class ElasticPore1(Topology):
   def check_region(self,
                    x:dtype, z:dtype,
                    inside:nb.types.Array, 
-                   step:nb.types.uint64) -> None:
+                   step:nb.types.uint64, 
+                   internal_state:tuple) -> None:
     raise NotImplementedError
 
   def to_hdf5(self, geom_grp: h5py.Group):
@@ -442,7 +227,7 @@ class ElasticPore1(Topology):
     return fig, ax
 
 class ElasticChannel1(Topology):
-  __version__='0.0.3'
+  __version__='0.0.4'
   def __init__(self, L: dtype, h: dtype, R: dtype, **kwargs) -> None:
     """Create a new channel geometry
 
@@ -469,6 +254,8 @@ class ElasticChannel1(Topology):
     self.L = L
     self.h = h
     self.R = R
+    regions = [{'name':'left', 'def':'x<=0'}]
+    self.regions = regions
 
     ## Geometrical parameters are treated as constants during the compilation
     @cuda.jit(device=True, inline=True)
@@ -593,15 +380,9 @@ class ElasticChannel1(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    @cuda.jit(device=True)
-    def check_region(x:dtype, z:dtype,
-                     inside:nb.types.Array, 
-                     step:nb.types.uint64) -> None:
-        if(x<=0):
-          cuda.atomic.add(inside, (step), 1)
+    self.check_region = Topology.compile_check_region(regions)
 
-    self.check_region = check_region
-  
+
   def compute_boundary_condition(self, 
                                  x0:dtype, z0:dtype, 
                                  x1:dtype, z1:dtype,
@@ -612,7 +393,8 @@ class ElasticChannel1(Topology):
   def check_region(self,
                    x:dtype, z:dtype,
                    inside:nb.types.Array, 
-                   step:nb.types.uint64) -> None:
+                   step:nb.types.uint64, 
+                   internal_state:tuple) -> None:
     raise NotImplementedError
 
   def to_hdf5(self, geom_grp: h5py.Group):
@@ -689,7 +471,7 @@ class ElasticChannel1(Topology):
     return fig, ax
 
 class AbsorbingChannel1(Topology):
-  __version__='0.0.2'
+  __version__='0.0.3'
   def __init__(self, L: dtype, h: dtype, R: dtype, l: float, **kwargs) -> None:
     """Create a new channel geometry with absorbing wall
 
@@ -719,6 +501,9 @@ class AbsorbingChannel1(Topology):
     self.h = h
     self.R = R
     self.l = l
+    regions = [{'name':'left', 'def':'x<=0'},
+               {'name':'absorbed', 'def':'internal_state[0] > 0'}]
+    self.regions = regions
 
     ## Geometrical parameters are treated as constants during the compilation
     @cuda.jit(device=True)
@@ -846,14 +631,8 @@ class AbsorbingChannel1(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    @cuda.jit(device=True)
-    def check_region(x:dtype, z:dtype,
-                     inside:nb.types.Array, 
-                     step:nb.types.uint64) -> None:
-        if(x<=0):
-          cuda.atomic.add(inside, (step), 1)
-
-    self.check_region = check_region
+    self.check_region = Topology.compile_check_region(regions)
+    
   
   def compute_boundary_condition(self, 
                                  x0:dtype, z0:dtype, 
@@ -865,7 +644,8 @@ class AbsorbingChannel1(Topology):
   def check_region(self,
                    x:dtype, z:dtype,
                    inside:nb.types.Array, 
-                   step:nb.types.uint64) -> None:
+                   step:nb.types.uint64, 
+                   internal_state:tuple) -> None:
     raise NotImplementedError
 
   def to_hdf5(self, geom_grp: h5py.Group):
@@ -946,5 +726,4 @@ class AbsorbingChannel1(Topology):
 
 _topologyDic = {ElasticPore1.__name__:ElasticPore1,
                 ElasticChannel1.__name__: ElasticChannel1,
-                ElasticChannelOld.__name__: ElasticChannelOld,
                 AbsorbingChannel1.__name__: AbsorbingChannel1}

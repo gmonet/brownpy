@@ -36,7 +36,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.0.7a'
+  __version__ = '0.0.8a'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -196,7 +196,10 @@ class Universe():
       if key not in groups_keys:
         raise KeyError(f"Available runs : {', '.join(groups_keys)}")
       with h5py.File(self._output_path, "r") as f:
-        for key, value in f[f'run/{key}'].items():
+        if 'run/trajectory' in f:
+          value = f[f'run/{key}/trajectory']
+          data['trajectory'] = value[...]
+        for key, value in f[f'run/{key}/regions/'].items():
           print(f'Reading {key} ...')
           # TODO: Test chunck with h5py
           # data[key] = np.empty(shape = value.shape, 
@@ -271,14 +274,15 @@ class Universe():
 
     # @cuda.jit(f'void({dtype}[:,:], uint64)')
     @cuda.jit
-    def engine(r0, t0, N_steps, sig, inside, rng_states, trajectory, freq_dumps):
+    def engine(r0, t0, N_steps, sig, inside, rng_states, trajectory, freq_dumps,
+               _internal_states):
       """Physical engine function compiled in CUDA to simulate pure brownian
       motion particles.
 
       Args:
         r0 (float32[:,2]): Initial position of particles 
         N_steps (uint64): Number of simulation step 
-        inside (uint32[:]): ouput array that will store the number of particles in predefinned regions as function of time 
+        inside (uint32[:,:]): ouput array that will store the number of particles in predefinned regions as function of time 
         rng_states (xoroshiro128p_dtype[:]): array of RNG states
         trajectory (float32[:,2,N_dumps]): output trajectory
       """
@@ -292,16 +296,19 @@ class Universe():
       if pos < r0.shape[0]:
         x0, z0 = r0[pos, 0], r0[pos, 1]
         i_dump = 0 
-        internal_state= cuda.local.array(1, nb.uint32)
-        for step in range(N_steps):
 
+        internal_state = cuda.local.array(1, nb.uint32)
+        for i in range(_internal_states.shape[1]):
+          internal_state[i] = _internal_states[pos, i]
+
+        for step in range(N_steps):
           dx = sig*xoroshiro128p_normal_float32(rng_states, pos)
           dz = sig*xoroshiro128p_normal_float32(rng_states, pos)
           x1 = x0 + dx
           z1 = z0 + dz
 
           x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, internal_state)
-          check_region(x1, z1, inside, step)
+          check_region(x1, z1, inside, step, internal_state)
 
           x0 = x1
           z0 = z1
@@ -312,6 +319,10 @@ class Universe():
               i_dump += 1
         r0[pos, 0] = x0
         r0[pos, 1] = z0
+
+        for i in range(_internal_states.shape[1]):
+           _internal_states[pos, i] = internal_state[i]
+
       if pos==0:
         t0 += N_steps
         
@@ -358,10 +369,16 @@ class Universe():
       rungrp.attrs['step_i'] = self._step
       rungrp.attrs['step_f'] = self._step + N_steps
       
-      region_0_ds = rungrp.create_dataset('region_0', dtype=np.uint16, 
-                                            shape=(N_steps,),
-                                            chunks=(max_chunk_size,))
-      region_0_ds.attrs['definition'] = 'x<=L/2'
+      N_regions = len(self._top.regions)
+      regionsgrp = rungrp.create_group("regions")
+      regions_ds = []
+      for region in self._top.regions:
+
+        region_ds = regionsgrp.create_dataset(region['name'], dtype=np.uint16, 
+                                              shape=(N_steps,),
+                                              chunks=(max_chunk_size,))
+        region_ds.attrs['definition'] = region['def']
+        regions_ds.append(region_ds)
 
       freq_dumps = nb.uint32(freq_dumps)
       if freq_dumps!=0:
@@ -391,8 +408,9 @@ class Universe():
       d_pos = cuda.to_device(self._pos)
       # TODO : use pinned array ?
       
-      # Allocate device memory to store number of particle in region 0
-      p_inside = cp.zeros(max_chunk_size, dtype=np.uint32)
+      # Allocate device memory to store number of particle in regions
+      p_inside = cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+      _internal_states = cp.zeros((N_particles, 1), dtype=np.uint32)
 
       # Allocate memory to store trajectory
       N_dumps = 0 if freq_dumps==0 else math.floor(max_chunk_size/freq_dumps)
@@ -417,7 +435,7 @@ class Universe():
         chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
 
         e0.record()
-        p_inside=cp.zeros(max_chunk_size, dtype=np.uint32)
+        p_inside=cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
         e1.record()
 
         self.engine[self._blockspergrid, 
@@ -428,7 +446,8 @@ class Universe():
                                            p_inside, # inside 
                                            rng_states, # rng_states
                                            d_trajectory, # trajectory
-                                           freq_dumps #freq_dumps
+                                           freq_dumps, #freq_dumps
+                                           _internal_states,
                                            )
 
         e2.record()
@@ -439,7 +458,8 @@ class Universe():
 
         t1_cpu = time.perf_counter()
         # Transfert result from RAM to drive
-        region_0_ds[i_step:i_step + max_chunk_size] = p_inside.get()[:chunk_size] # Transfert result from RAM to drive
+        for i in range(N_regions):
+          regions_ds[i][i_step:i_step + max_chunk_size] = p_inside.get()[i, :chunk_size] # Transfert result from RAM to drive
         if freq_dumps!=0:
           i_N_dumps = math.floor(chunk_size/freq_dumps)
           traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
