@@ -70,7 +70,7 @@ class Universe():
     # Define number of particles and their properties
     self._N = N
     self._D = D
-
+    
     # Fix computation precision (TODO: make it compatible with saving in netcdf file)
     self._dtype = 'float32'
 
@@ -196,10 +196,12 @@ class Universe():
       if key not in groups_keys:
         raise KeyError(f"Available runs : {', '.join(groups_keys)}")
       with h5py.File(self._output_path, "r") as f:
-        if 'run/trajectory' in f:
+        if f'run/{key}/trajectory' in f:
+          print(f'Reading trajectory ...')
           value = f[f'run/{key}/trajectory']
           data['trajectory'] = value[...]
-        for key, value in f[f'run/{key}/regions/'].items():
+          print(f'... Done')
+        for name, value in f[f'run/{key}/regions/'].items():
           print(f'Reading {key} ...')
           # TODO: Test chunck with h5py
           # data[key] = np.empty(shape = value.shape, 
@@ -209,7 +211,7 @@ class Universe():
           #   pbar = tqdm(total=total)
           #   for i in range(0, total, split):
           #     value[i:i+split]
-          data[key] = value[...]
+          data[name] = value[...]
           print(f'... Done')
       return data
     else:
@@ -271,10 +273,10 @@ class Universe():
     """
     compute_boundary_condition = self._top.compute_boundary_condition
     check_region = self._top.check_region
+    scale = nb.float32(math.sqrt(2*D*dt))
 
-    # @cuda.jit(f'void({dtype}[:,:], uint64)')
     @cuda.jit
-    def engine(r0, t0, N_steps, sig, inside, rng_states, trajectory, freq_dumps,
+    def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
                _internal_states):
       """Physical engine function compiled in CUDA to simulate pure brownian
       motion particles.
@@ -292,7 +294,6 @@ class Universe():
 
       pos = cuda.grid(1)
       dx, dz = nb.float32(0.0), nb.float32(0.0)
-
       if pos < r0.shape[0]:
         x0, z0 = r0[pos, 0], r0[pos, 1]
         i_dump = 0 
@@ -302,8 +303,8 @@ class Universe():
           internal_state[i] = _internal_states[pos, i]
 
         for step in range(N_steps):
-          dx = sig*xoroshiro128p_normal_float32(rng_states, pos)
-          dz = sig*xoroshiro128p_normal_float32(rng_states, pos)
+          dx = scale*xoroshiro128p_normal_float32(rng_states, pos)
+          dz = scale*xoroshiro128p_normal_float32(rng_states, pos)
           x1 = x0 + dx
           z1 = z0 + dz
 
@@ -325,7 +326,7 @@ class Universe():
 
       if pos==0:
         t0 += N_steps
-        
+    
     self.engine = engine
 
   def plot_pos(self, s=0.1, **fig_kwargs):
@@ -427,17 +428,16 @@ class Universe():
       # transfertStream1 = cuda.stream()
       # transfertStream2 = cuda.stream()
       dt1, dt2, dt3 = [], [], []
-      dt1_cpu, dt2_cpu = [], []
+      t0_cpu = time.perf_counter()
       pbar = tqdm(total=math.ceil(N_steps))
       for i_chunk, i_step in enumerate(range(0, N_steps, max_chunk_size)):
-        t0_cpu = time.perf_counter()
         chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
         chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
 
         e0.record()
         p_inside=cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
         e1.record()
-
+        freq_dumps=0
         self.engine[self._blockspergrid, 
                     self._threadsperblock](d_pos, # r0
                                            self._step, # t0 
@@ -456,7 +456,7 @@ class Universe():
         if freq_dumps!=0: d_trajectory.copy_to_host(trajectory)
         
 
-        t1_cpu = time.perf_counter()
+        
         # Transfert result from RAM to drive
         for i in range(N_regions):
           regions_ds[i][i_step:i_step + max_chunk_size] = p_inside.get()[i, :chunk_size] # Transfert result from RAM to drive
@@ -465,20 +465,20 @@ class Universe():
           traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
 
         self._step += chunk_size
-
-        t2_cpu = time.perf_counter()
         e3.record()
         cuda.synchronize()
         dt1.append(cuda.event_elapsed_time(e0,e1)*1E-3)
         dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
         dt3.append(cuda.event_elapsed_time(e2,e3)*1E-3)
-        dt1_cpu.append(t1_cpu - t0_cpu)
-        dt2_cpu.append(t2_cpu - t1_cpu)
         pbar.set_postfix(total = f'{prefix(self._step*self.dt*1E-15)}s')
         pbar.update(chunk_size)
     pbar.close()
-    dt1, dt2, dt3 = np.mean(dt1), np.mean(dt2), np.mean(dt3)
-    dt1_cpu, dt2_cpu = np.mean(dt1_cpu), np.mean(dt2_cpu)
+    del d_trajectory, d_pos
+    del trajectory
+    cuda.synchronize()
+    t1_cpu = time.perf_counter()
+    dt_cpu = t1_cpu - t0_cpu
+    dt1, dt2, dt3 = N_chunks*np.mean(dt1), N_chunks*np.mean(dt2), N_chunks*np.mean(dt3)
     print(f'With {N_particles} particles')
     print(f'------------------------------------------')
     print(f'GPU time per step and per particles:')
@@ -488,14 +488,11 @@ class Universe():
     print(f'Total: {prefix((dt1+dt2+dt3)/N_steps/N_particles)}s')
     print(f'------------------------------------------')
     print(f'CPU time per step and per particles:')
-    print(f'Other: {prefix(dt1_cpu/N_steps/N_particles)}s')
-    print(f'Transfert to drive: {prefix(dt2_cpu/N_steps/N_particles)}s')
-    print(f'Total: {prefix((dt1_cpu+dt2_cpu)/N_steps/N_particles)}s')
+    print(f'Total: {prefix(dt_cpu/N_steps/N_particles)}s')
     print(f'------------------------------------------')
     print(f'For a timestep of {prefix(dt*1E-15)}s')
-    print(f'To simulate the trajectory of 1 particle during 1 s, we need {prefix(((dt1_cpu+dt2_cpu)/N_steps/N_particles)*(1E15/dt))}s')
-    del d_trajectory, d_pos
-    del trajectory
+    print(f'To simulate the trajectory of 1 particle during 1 s, we need {prefix((dt_cpu/N_steps/N_particles)*(1E15/dt))}s')
+    
     # return True
 
 
