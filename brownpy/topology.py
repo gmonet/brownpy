@@ -20,7 +20,18 @@ MAX_BOUNCE = 4
 
   
 class Topology():
-  def compile_check_region(regions):
+  def __init__(self) -> None:
+      self.check_region = Topology.compile_check_region(self, self.regions)
+
+  def __str__(self) -> str:
+      text = self.__class__.__name__ + '\n'
+      text+= f'version {self.__class__.__version__}\n'
+      for key, value in self.__dict__.items() :
+        if isinstance(value, (bool, int, float, str)):
+          text += f'{key}={value}\n'
+      return text
+  
+  def compile_check_region(self, regions):
     '''
     Create device CUDA function from defined regions
     Args:
@@ -43,8 +54,12 @@ class Topology():
         cuda.atomic.add(inside, ({i}, step), 1)
       '''
     code_check_region = textwrap.dedent(code_check_region)
+    input_dict=globals()
+    for key, value in self.__dict__.items() :
+        if isinstance(value, (bool, int, float, str)):
+          input_dict[key]=value
     return_dict={}
-    exec(code_check_region, globals(), return_dict)
+    exec(code_check_region, input_dict, return_dict)
     return return_dict['check_region']
 
   def fill_geometry(self, N: uint):
@@ -53,11 +68,18 @@ class Topology():
     raise NotImplementedError
 
   def to_hdf5(self, geom_grp: h5py.Group):
-    raise NotImplementedError
+    geom_grp.attrs['name'] = self.__class__.__name__
+    geom_grp.attrs['version'] = self.__class__.__version__
+    for key, value in self.__dict__.items() :
+      if isinstance(value, (bool, int, float, str)):
+        geom_grp.attrs[key] = value
 
   @classmethod
   def from_hdf5(cls, geom_grp: h5py.Group):
-    raise NotImplementedError
+    dic = geom_grp.attrs
+    if dic['__version__'] != cls.__version__:
+      raise DeprecationWarning('Depreciated version of h5py file')
+    return cls(**dic)
 
   def compute_boundary_condition(self, 
                                  x0:dtype, z0:dtype, 
@@ -101,11 +123,10 @@ class Infinite(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
+    super().__init__()
 
   def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = Infinite.__name__
-    geom_grp['version'] = Infinite.__version__
+    super().to_hdf5(geom_grp)
 
     Rgrp = geom_grp.create_group("reservoir")
     Cgrp = geom_grp.create_group("pore")
@@ -204,15 +225,14 @@ class InfiniteSlitAbsorbing(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
+    super().__init__()
 
   def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = InfiniteSlitAbsorbing.__name__
-    geom_grp['version'] = InfiniteSlitAbsorbing.__version__
+    super().to_hdf5(geom_grp)
+
     geom_grp.attrs['L'], geom_grp.attrs['h'] = self.L, self.h
     geom_grp.attrs['l'] = self.l
     geom_grp.attrs['bc'] = 'absorbing'
-
 
   @classmethod
   def from_hdf5(cls, geom_grp: h5py.Group):
@@ -283,11 +303,11 @@ class Periodic(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
+    super().__init__()
 
   def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = Periodic.__name__
-    geom_grp['version'] = Periodic.__version__
+    super().to_hdf5(geom_grp)
+
     Rgrp = geom_grp.create_group("reservoir")
     Rgrp.attrs['L'] = self.L
 
@@ -392,11 +412,11 @@ class ElasticPore1(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
+    super().__init__()
 
   def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = ElasticPore1.__name__
-    geom_grp['version'] = ElasticPore1.__version__
+    super().to_hdf5(geom_grp)
+
     Rgrp = geom_grp.create_group("reservoir")
     Rgrp.attrs['Lm'] = self.L
     Rgrp.attrs['L'] = self.L
@@ -413,6 +433,7 @@ class ElasticPore1(Topology):
     top = cls(Lm=geom_grp['reservoir'].attrs['Lm'],
               L=geom_grp['reservoir'].attrs['L'],
               R=geom_grp['pore'].attrs['R'])
+    return top
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
@@ -598,26 +619,7 @@ class ElasticChannel1(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
-
-  def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = ElasticChannel1.__name__
-    geom_grp['version'] = ElasticChannel1.__version__
-    Rgrp = geom_grp.create_group("reservoir")
-    Rgrp.attrs['R'] = self.R
-    Rgrp.attrs['bc_x'] = 'elastic'
-    Rgrp.attrs['bc_z'] = 'periodic'
-    Rgrp.attrs['bc_x_membrane'] = 'elastic'
-
-    Cgrp = geom_grp.create_group("channel")
-    Cgrp.attrs['L'], Cgrp.attrs['h'] = self.L, self.h
-    Cgrp.attrs['bc'] = 'elastic'
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(L=geom_grp['channel'].attrs['L'],
-              h=geom_grp['channel'].attrs['h'],
-              R=geom_grp['reservoir'].attrs['R'])
+    super().__init__()
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
@@ -665,6 +667,229 @@ class ElasticChannel1(Topology):
     ax.plot([-L/2, +L/2], [-h/2, -h/2], **border_kwargs)
     ax.plot([-L/2, -L/2], [-R, -h/2], **border_kwargs)
     ax.plot([+L/2, +L/2], [-R, -h/2], **border_kwargs)
+    ax.set_xlabel('x [Å]')
+    ax.set_ylabel('y [Å]')
+    ax.set_aspect('equal')
+    ax.set_aspect('equal')
+    return fig, ax
+
+class ElasticChannel2(Topology):
+  __version__='0.0.1'
+
+  def __init__(self, 
+               L: dtype, H: dtype, 
+               Lc: dtype, Hc: dtype, **kwargs) -> None:
+    """Create a new channel geometry
+
+    ┃         ┃   ┃         ┃      ↑  
+    ┃         ┃   ┃         ┃      │
+    ┃         ┗━━━┛         ┃      │
+    ┃                       ┃ ↕ Hc │ 2 H
+    ┃         ┏━━━┓         ┃      │
+    ┃         ┃   ┃         ┃      │
+    ┃         ┃   ┃         ┃      ↓
+     ←-------→ ←-→ ←-------→
+         L      Lc     L
+
+
+    ┃ : Elastic wall
+
+    Args:
+      L (float in A): Depth of reservoirs
+      H (float in A): Reservoir height
+      Lc (float in A): Length of the channel
+      Hc (float in A): Height of the channel
+    kwargs (advanced parameters):
+      seed (int): set seed
+    """
+    self.L, self.H = L, H
+    self.Lc, self.Hc = Lc, Hc
+    regions = [{'name':'left',  'def':'x<=-Lc/2'},
+               {'name':'right', 'def':'x>=Lc/2'}]
+    # regions=[]
+    self.regions = regions
+
+    ## Geometrical parameters are treated as constants during the compilation
+    @jit
+    def compute_boundary_condition(x0:dtype, z0:dtype, 
+                                   x1:dtype, z1:dtype,
+                                   rng_states:array,
+                                   internal_state:tuple):
+      toCheck = True
+      i_BOUNCE = 0
+      while toCheck and i_BOUNCE < MAX_BOUNCE:
+        toCheck = False
+        if i_BOUNCE > 4:
+          x1 = (x0+x1)/2
+          z1 = (z0+z1)/2
+        
+        # Fast skip if trajectory stay in reservoirs
+        if (math.fabs(x1)<L+Lc/2) and (math.fabs(x1)>L/2) and \
+           (math.fabs(x0)<L+Lc/2) and (math.fabs(x0)>L/2):
+           break
+        
+        #Intersection with left wall
+        X, Z = -L-Lc/2, 0
+        NX, NZ = 1, 0
+        if x1<X:
+          x1, z1 = bc.ReflectIntoPlane(x0, z0,
+                                       x1, z1,
+                                       X, Z,
+                                       NX, NZ)
+          break
+
+        # Intersection with left membrane
+        X, Z = -Lc/2, 0
+        NX, NZ = 1, 0
+        if x0<X and x1>X:
+          den = (x1-x0)*NX + (z1-z0)*NZ
+          if den!=0:
+            t = ((X-x0)*NX + (Z-z0)*NZ)/den
+            if (t>0) and (t<1):
+              xint = t*x1 + (1-t)*x0
+              zint = t*z1 + (1-t)*z0
+              if math.fabs(zint) > Hc/2:
+                x1, z1 = bc.ReflectIntoPlane(x0, z0,
+                                       x1, z1,
+                                       X, Z,
+                                       NX, NZ)
+                break
+
+        # Intersection with bottom channel
+        X, Z = 0, -Hc/2
+        NX, NZ = 0, 1
+        if z0>Z and z1<Z:
+          den = (x1-x0)*NX + (z1-z0)*NZ
+          if den!=0:
+            t = ((X-x0)*NX + (Z-z0)*NZ)/den
+            if (t>0) and (t<1):
+              xint = t*x1 + (1-t)*x0
+              zint = t*z1 + (1-t)*z0
+              if math.fabs(xint) < Lc/2:
+                x1, z1 = bc.ReflectIntoPlane(x0, z0,
+                                       x1, z1,
+                                       X, Z,
+                                       NX, NZ)
+                toCheck = True
+                continue
+        
+        # Intersection with top channel
+        X, Z = 0, +Hc/2
+        NX, NZ = 0, 1
+        if z0<Z and z1>Z:
+          den = (x1-x0)*NX + (z1-z0)*NZ
+          if den!=0:
+            t = ((X-x0)*NX + (Z-z0)*NZ)/den
+            if (t>0) and (t<1):
+              xint = t*x1 + (1-t)*x0
+              zint = t*z1 + (1-t)*z0
+              if math.fabs(xint) < Lc/2:
+                x1, z1 = bc.ReflectIntoPlane(x0, z0,
+                                       x1, z1,
+                                       X, Z,
+                                       NX, NZ)
+                toCheck = True
+                continue
+                                
+        # Intersection with right membrane
+        X, Z = +Lc/2, 0
+        NX, NZ = 1, 0
+        if x0>X and x1<X:
+          den = (x1-x0)*NX + (z1-z0)*NZ
+          if den!=0:
+            t = ((X-x0)*NX + (Z-z0)*NZ)/den
+            if (t>0) and (t<1):
+              xint = t*x1 + (1-t)*x0
+              zint = t*z1 + (1-t)*z0
+              if math.fabs(zint) > Hc/2:
+                x1, z1 = bc.ReflectIntoPlane(x0, z0,
+                                       x1, z1,
+                                       X, Z,
+                                       NX, NZ)
+                break
+
+        # Intersection with right wall
+        X, Z = +L+Lc/2, 0
+        NX, NZ = 1, 0
+        if x1>X:
+          x1, z1 = bc.ReflectIntoPlane(x0, z0,
+                                       x1, z1,
+                                       X, Z,
+                                       NX, NZ)
+          break
+        
+      
+        i_BOUNCE += 1
+        # if i_BOUNCE>=MAX_BOUNCE-2:
+        #   print(pos, i_BOUNCE, x0, z0, x1, z1)
+      
+      # Periodic boundary condition along z:
+      z1 = (H + z1)%(2*H) - H
+
+      return x1, z1
+    self.compute_boundary_condition = compute_boundary_condition
+
+    super().__init__()
+
+  def fill_geometry(self, N: uint, seed=None) -> ndarray:
+    rng = np.random.default_rng(seed)
+
+    # Get geometry parameters
+    L, H = self.L, self.H
+    Lc, Hc = self.Lc, self.Hc
+
+    # Surface of reservoirs
+    S_R = (2*L) * (2*H)
+    # Surface of the channel
+    S_c = Lc * Hc
+
+    # Put particles in reservoirs
+    N_R = int(np.ceil(N*S_R/(S_R+S_c)))
+    r0_R = rng.uniform((-L, -H), (L, H), size=(N_R, 2))
+
+    r0_R[np.where(r0_R[:, 0] < 0), 0] -= Lc/2
+    r0_R[np.where(r0_R[:, 0] >= 0), 0] += Lc/2
+
+    # Number of particles in channel
+    N_c = N-N_R
+    if N_c > 0:
+      r0_c = rng.uniform((-Lc/2, -Hc/2), (Lc/2, Hc/2), size=(N_R, 2))
+      r0 = np.concatenate((r0_R, r0_c))
+    else:
+      r0 = r0_R
+
+    return r0.astype(dtype)
+
+  def plot(self, ax=None, 
+           border_kwargs={'elastic':{'c': 'r'},
+                          'periodic':{'c': 'r', 'ls': '--'}
+                          }):
+    if ax is None:
+      fig, ax = plt.subplots()
+    fig = ax.get_figure()
+
+    # Get geometry parameters
+    L, H = self.L, self.H
+    Lc, Hc = self.Lc, self.Hc
+
+    # Draw geometry
+    # Reservoir borders
+    ax.plot([-L-Lc/2, -L-Lc/2], [-H, +H], **border_kwargs['elastic'])
+    ax.plot([+L+Lc/2, +L+Lc/2], [-H, +H], **border_kwargs['elastic'])
+    # Periodic boundary condition
+    ax.plot([-L-Lc/2, -Lc/2], [-H, -H], **border_kwargs['periodic'])
+    ax.plot([-L-Lc/2, -Lc/2], [+H, +H], **border_kwargs['periodic'])
+    ax.plot([+L+Lc/2, +Lc/2], [-H, -H], **border_kwargs['periodic'])
+    ax.plot([+L+Lc/2, +Lc/2], [+H, +H], **border_kwargs['periodic'])
+    # Membranes
+    ax.plot([-Lc/2, -Lc/2], [-H, -Hc/2], **border_kwargs['elastic'])
+    ax.plot([-Lc/2, -Lc/2], [+H, +Hc/2], **border_kwargs['elastic'])
+    ax.plot([+Lc/2, +Lc/2], [-H, -Hc/2], **border_kwargs['elastic'])
+    ax.plot([+Lc/2, +Lc/2], [+H, +Hc/2], **border_kwargs['elastic'])
+    # Channel wall
+    ax.plot([-Lc/2, +Lc/2], [-Hc/2, -Hc/2], **border_kwargs['elastic'])
+    ax.plot([-Lc/2, +Lc/2], [+Hc/2, +Hc/2], **border_kwargs['elastic'])
+
     ax.set_xlabel('x [Å]')
     ax.set_ylabel('y [Å]')
     ax.set_aspect('equal')
@@ -832,11 +1057,11 @@ class AbsorbingChannel1(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
+    super().__init__()
     
   def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = AbsorbingChannel1.__name__
-    geom_grp['version'] = AbsorbingChannel1.__version__
+    super().to_hdf5(geom_grp)
+
     Rgrp = geom_grp.create_group("reservoir")
     Rgrp.attrs['R'] = self.R
     Rgrp.attrs['bc_x'] = 'elastic'
@@ -1063,11 +1288,11 @@ class SpeedElasticChannel1_dev(Topology):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
-    self.check_region = Topology.compile_check_region(regions)
+    super().__init__()
 
   def to_hdf5(self, geom_grp: h5py.Group):
-    geom_grp['name'] = ElasticChannel1.__name__
-    geom_grp['version'] = ElasticChannel1.__version__
+    super().to_hdf5(geom_grp)
+
     Rgrp = geom_grp.create_group("reservoir")
     Rgrp.attrs['R'] = self.R
     Rgrp.attrs['bc_x'] = 'elastic'
@@ -1135,7 +1360,3 @@ class SpeedElasticChannel1_dev(Topology):
     ax.set_aspect('equal')
     ax.set_aspect('equal')
     return fig, ax
-
-_topologyDic = {ElasticPore1.__name__:ElasticPore1,
-                ElasticChannel1.__name__: ElasticChannel1,
-                AbsorbingChannel1.__name__: AbsorbingChannel1}

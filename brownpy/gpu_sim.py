@@ -36,7 +36,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.0.8a'
+  __version__ = '0.0.9a'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -44,6 +44,7 @@ class Universe():
                N: int,
                D: float, dt: int,
                output_path: str,
+               overwrite=False,
                **kwargs):
     """Create a raw new Universe from topology parameters
 
@@ -55,6 +56,7 @@ class Universe():
       D (float in A^2/fs): Diffusion coefficient
       dt (float in fs): Simulation timestep
       output_path (str): Output netcdf file
+      overwrite (bool): if false iterate the name of output file to avoid overwriting
     kwargs (advanced parameters):
       gpu_memory (int, optional): GPU memory size to use. Default to 2*1024**3 (2GiB)
       threadsperblock (int, optional): Number of thread per block. Default to 128
@@ -100,7 +102,7 @@ class Universe():
     self._output_path = output_path
     if not kwargs.get('_outputFileProvided', False):
       # Create a netcdf simulation file
-      self._initOutputFile(output_path)
+      self._initOutputFile(output_path, overwrite)
   
   @classmethod
   def from_hdf5(cls, input_path: str):
@@ -115,10 +117,10 @@ class Universe():
       raise FileNotFoundError(f"{str(input_path)} doesn't exist.")
 
     with h5py.File(str(input_path), "r") as f:
-      top_name = f['geometry']['name']
-      top_class = topology._topologyDic[top_name]
-
-      u = cls(top=top_class.from_hdf5(f['geometry']),
+      top_name = f['geometry'].attrs['name']
+      top_class = getattr(topology, top_name)
+      top = top_class.from_hdf5(f['geometry'])
+      u = cls(top=top,
               N=f['particles'].attrs['N'],
               D=f['particles']['0'].attrs['D'],
               dt=f.attrs['dt'],
@@ -202,7 +204,8 @@ class Universe():
           data['trajectory'] = value[...]
           print(f'... Done')
         for name, value in f[f'run/{key}/regions/'].items():
-          print(f'Reading {key} ...')
+          data[name] = value[...]
+          print(f'{name}  read')
           # TODO: Test chunck with h5py
           # data[key] = np.empty(shape = value.shape, 
           #                      dtype = value.dtype)
@@ -211,22 +214,22 @@ class Universe():
           #   pbar = tqdm(total=total)
           #   for i in range(0, total, split):
           #     value[i:i+split]
-          data[name] = value[...]
-          print(f'... Done')
       return data
     else:
       raise TypeError(f'universe indices must be integers or str, not {type(key)}')
-    
-  def _initOutputFile(self, output_path: str):
+  
+  def _initOutputFile(self, output_path: str, overwrite:bool):
     """Create and initialize the netcdf simulation file
     Args:
       output_path (str): Output netcdf file
+      overwrite (bool): if false iterate the name of output file to avoid overwriting
     """
     # Check if the file already exists.
     # If yes, the file name will be incremented.
     output_path = Path(output_path).resolve()
     output_path = output_path.with_suffix('.hdf5')
-    if output_path.exists():
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and overwrite is False:
         i = 1
         output_path_inc = output_path.with_name(
             output_path.stem+f'_{i}'+output_path.suffix)
@@ -330,7 +333,7 @@ class Universe():
     
     self.engine = engine
 
-  def plot_pos(self, s=0.1, **fig_kwargs):
+  def plot(self, ax=None, scatter_kwargs={'s': 0.1}):
     """Plot current position of particles
 
     Args:
@@ -339,9 +342,12 @@ class Universe():
     """
     # Get current position
     pos = self.pos
-    fig, ax = plt.subplots(**fig_kwargs)
+    if ax is None:
+      fig, ax = plt.subplots()
+    fig = ax.get_figure()
+
     # Draw particles as scatter
-    ax.scatter(pos[:, 0], pos[:, 1], s)
+    ax.scatter(pos[:, 0], pos[:, 1], **scatter_kwargs)
     
     # Draw geometry
     top = self._top
@@ -392,6 +398,7 @@ class Universe():
                                         # chunks=(self.N,2,N_dumps)
                                         # ValueError: Number of elements in chunk must be < 4gb (number of elements in chunk must be < 4GB)
                                         )
+        rungrp
         # TODO: resize faster
         traj_ds.attrs['freq_dumps'] = freq_dumps
       else:
@@ -495,6 +502,7 @@ class Universe():
 
 
 if __name__ == "__main__":
+
   dt = int(1E6) #fs (1ns) - time steps
   D = 1.5E-4 # A²/fs  (1.5E-9 m²/s) - Diffusion coefficient
 
@@ -503,9 +511,10 @@ if __name__ == "__main__":
   h = 1E2 # A (10nm)  - channel height
   R = 1E4 # A (1um) - reservoir size
 
-  N= 8*1024
+  N= 4*1024
 
-  u = Universe(N=N, L=L, h=h, R=R, D=D, dt=dt,
-              output_path='simu.hdf5')
-
-  u.run3(48_023, freq_dumps=10);
+  top = topology.ElasticChannel1(L=L, h=h, R=R)
+  u = Universe(N=N, top=top, D=D, dt=dt,
+              output_path='simu', overwrite=True)
+  u.run(10000, freq_dumps=100)
+  # u2 = Universe.from_hdf5(u.output_path)
