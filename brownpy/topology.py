@@ -89,6 +89,7 @@ class Infinite(Topology):
       seed (int): set seed
     """
     regions = []
+    regions = [{'name':'left', 'def':'x<=0'}]
     self.regions = regions
 
     ## Geometrical parameters are treated as constants during the compilation
@@ -122,6 +123,120 @@ class Infinite(Topology):
     if ax is None:
       fig, ax = plt.subplots()
     fig = ax.get_figure()
+
+    ax.set_xlabel('x [Å]')
+    ax.set_ylabel('y [Å]')
+    ax.set_aspect('equal')
+    ax.set_aspect('equal')
+    return fig, ax
+
+class InfiniteSlitAbsorbing(Topology):
+  __version__='0.0.1'
+  def __init__(self, L: dtype, h: dtype, l: float, **kwargs) -> None:
+    """Inifinite slit with absorbing walls
+
+    ━━━━━━━━━━━━━━━━━━━━━ ↑  
+                          │
+                          │
+                          │ h
+                          │
+                          │
+    ━━━━━━━━━━━━━━━━━━━━━ ↓ 
+    ←-------------------→
+              L   
+    ━━ : Absorbing wall
+
+    Args:
+      L (float in A): Length of the channel
+      h (float in A): Height of the channel
+      l (float in dt-1) : Desorption frequency  
+    kwargs (advanced parameters):
+      seed (int): set seed
+    """
+    self.L, self.h = L, h
+    self.l = l
+    regions = [{'name':'absorbed', 'def':'internal_state[0] > 0'}]
+    self.regions = regions
+    
+    ## Geometrical parameters are treated as constants during the compilation
+    @jit
+    def compute_boundary_condition(x0:dtype, z0:dtype, 
+                                   x1:dtype, z1:dtype,
+                                   rng_states:array,
+                                   internal_state:tuple):
+      pos = cuda.grid(1)
+
+      if internal_state[0] != 0:
+        internal_state[0] -= 1
+        x1 = x0
+        z1 = z0
+        return x1, z1
+        
+      # Intersection with bottom channel
+      X, Z = 0, -h/2
+      NX, NZ = 0, 1
+      if z1<Z:
+        den = (x1-x0)*NX + (z1-z0)*NZ
+        if den!=0:
+          t = ((X-x0)*NX + (Z-z0)*NZ)/den
+          xint = t*x1 + (1-t)*x0
+          zint = t*z1 + (1-t)*z0
+          x1, z1 = xint, zint
+          T = -(1/l)*math.log(1-xoroshiro128p_uniform_float32(rng_states, pos))
+          internal_state[0] = uint32(T)
+      
+      # Intersection with top channel
+      X, Z = 0, +h/2
+      NX, NZ = 0, 1
+      if z1>Z:
+        den = (x1-x0)*NX + (z1-z0)*NZ
+        if den!=0:
+          t = ((X-x0)*NX + (Z-z0)*NZ)/den
+          xint = t*x1 + (1-t)*x0
+          zint = t*z1 + (1-t)*z0
+          x1, z1 = xint, zint
+          T = -(1/l)*math.log(1-xoroshiro128p_uniform_float32(rng_states, pos))
+          internal_state[0] = uint32(T)
+
+      # Periodic boundary condition along x:
+      x1 = (L/2 + x1)%(L) - L/2
+
+      return x1, z1
+    self.compute_boundary_condition = compute_boundary_condition
+
+    self.check_region = Topology.compile_check_region(regions)
+
+  def to_hdf5(self, geom_grp: h5py.Group):
+    geom_grp['name'] = InfiniteSlitAbsorbing.__name__
+    geom_grp['version'] = InfiniteSlitAbsorbing.__version__
+    geom_grp.attrs['L'], geom_grp.attrs['h'] = self.L, self.h
+    geom_grp.attrs['l'] = self.l
+    geom_grp.attrs['bc'] = 'absorbing'
+
+
+  @classmethod
+  def from_hdf5(cls, geom_grp: h5py.Group):
+    top = cls(L=geom_grp.attrs['L'],
+              h=geom_grp.attrs['h'],
+              l=geom_grp.attrs['l'])
+
+  def fill_geometry(self, N: uint, seed=None) -> ndarray:
+    rng = np.random.default_rng(seed)
+    L, h = self.L, self.h
+    r0 = rng.uniform((-L/2, -h/2), (L/2, h/2), size=(N, 2))
+    return r0.astype(dtype)
+
+  def plot(self, ax=None, border_kwargs={'c': 'r'}):
+    if ax is None:
+      fig, ax = plt.subplots()
+    fig = ax.get_figure()
+
+    L, h = self.L, self.h
+
+    # Draw geometry
+
+    ax.plot([-L/2, +L/2], [-h/2, -h/2], **border_kwargs)
+    ax.plot([-L/2, +L/2], [+h/2, +h/2], **border_kwargs)
 
     ax.set_xlabel('x [Å]')
     ax.set_ylabel('y [Å]')

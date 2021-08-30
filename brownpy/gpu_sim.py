@@ -273,7 +273,7 @@ class Universe():
     """
     compute_boundary_condition = self._top.compute_boundary_condition
     check_region = self._top.check_region
-    scale = nb.float32(math.sqrt(2*D*dt))
+    scale = nb.float32(math.sqrt(2*self.D*self.dt))
 
     @cuda.jit
     def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
@@ -289,6 +289,7 @@ class Universe():
         trajectory (float32[:,2,N_dumps]): output trajectory
       """
       N_dumps = trajectory.shape[2] # number of position dump
+      # freq_dumps = 0
       # if N_dumps != 0:
       #   freq_dumps = math.ceil(N_steps/N_dumps)
 
@@ -402,7 +403,6 @@ class Universe():
         
       N_particles = self.N
       D, dt = self.D, self.dt
-      scale = nb.float32(math.sqrt(2*D*dt))
       dtype = self._dtype
 
       # Transfert current position to device
@@ -437,12 +437,10 @@ class Universe():
         e0.record()
         p_inside=cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
         e1.record()
-        freq_dumps=0
         self.engine[self._blockspergrid, 
                     self._threadsperblock](d_pos, # r0
                                            self._step, # t0 
-                                           chunk_size, # N_steps 
-                                           scale, # sig
+                                           chunk_size, # N_steps
                                            p_inside, # inside 
                                            rng_states, # rng_states
                                            d_trajectory, # trajectory
