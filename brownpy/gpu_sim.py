@@ -119,6 +119,9 @@ class Universe():
     with h5py.File(str(input_path), "r") as f:
       top_name = f['geometry'].attrs['name']
       top_class = getattr(topology, top_name)
+      if f.attrs['version'] != cls.__version__:
+        raise DeprecationWarning('Depreciated version of h5py file')
+        
       top = top_class.from_hdf5(f['geometry'])
       u = cls(top=top,
               N=f['particles'].attrs['N'],

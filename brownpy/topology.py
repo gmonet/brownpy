@@ -77,8 +77,6 @@ class Topology():
   @classmethod
   def from_hdf5(cls, geom_grp: h5py.Group):
     dic = geom_grp.attrs
-    if dic['__version__'] != cls.__version__:
-      raise DeprecationWarning('Depreciated version of h5py file')
     return cls(**dic)
 
   def compute_boundary_condition(self, 

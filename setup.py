@@ -15,7 +15,7 @@ setup(
         'matplotlib>=3.1.1',
         'numba>=0.45.1',
         'tqdm>=4.36.1',
-        'netCDF4>=1.5.3',
+        'netCDF4>=3',
     ],
     include_package_data=True,
 )
