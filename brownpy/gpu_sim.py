@@ -24,7 +24,7 @@ from brownpy.utils import prefix
 class Universe():
   """The Universe contains all the information describing the system.
 
-  It contains information about the topologt of the system as the
+  It contains information about the topology of the system as the
   geometry, the timestep, the number of particles, their diffusion coefficient,
   the boundary condition ...
 
@@ -121,7 +121,7 @@ class Universe():
       top_class = getattr(topology, top_name)
       if f.attrs['version'] != cls.__version__:
         raise DeprecationWarning('Depreciated version of h5py file')
-        
+
       top = top_class.from_hdf5(f['geometry'])
       u = cls(top=top,
               N=f['particles'].attrs['N'],
