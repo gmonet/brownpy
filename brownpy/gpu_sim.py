@@ -183,7 +183,7 @@ class Universe():
     """str: Get path to the netcdf output path."""
     return self._output_path
   #endregion
-
+  
   def __len__(self):
     with h5py.File(self._output_path, "r") as f:
       N_runs = f['run'].attrs['N_runs']
@@ -222,6 +222,22 @@ class Universe():
     else:
       raise TypeError(f'universe indices must be integers or str, not {type(key)}')
   
+  def __str__(self) -> str:
+    text = ''
+    def visitor_func(name, node):
+      if isinstance(node, h5py.Dataset):
+        text += f'{node.name} {node.shape} {node.dtype}'
+      else:
+        print(node.name)
+        for key, val in node.attrs.items():
+          text+= f'{node.name} {key}: {val}'
+
+    with h5py.File(self.output_path, 'r') as f:
+      for key, val in f.attrs.items():
+          text = f'/{key}:{val}'
+      f.visititems(visitor_func)
+    return text
+
   def _initOutputFile(self, output_path: str, overwrite:bool):
     """Create and initialize the netcdf simulation file
     Args:
