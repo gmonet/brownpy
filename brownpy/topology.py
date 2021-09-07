@@ -11,6 +11,7 @@ from numpy import array, float32, ndarray, uint, uint32
 from numba.cuda.random import xoroshiro128p_uniform_float32
 
 from brownpy import bc
+from brownpy.settings import _GPU_COMPUTATION
 
 dtype=float32
 
@@ -18,10 +19,21 @@ dtype=float32
 # It may happen that the elastic bounce of a particle lead it to another wall    
 MAX_BOUNCE = 4
 
-  
+
+
 class Topology():
   def __init__(self) -> None:
       self.check_region = Topology.compile_check_region(self, self.regions)
+      if _GPU_COMPUTATION:
+        @jit(nopython=True, device=True)
+        def get_random_uniform(rng_states):
+          pos = cuda.grid(1)
+          return xoroshiro128p_uniform_float32(rng_states, pos)
+      else:
+        @jit(nopython=True)
+        def get_random_uniform(rng_states):
+          return np.random.standard_normal()
+      self.get_random_uniform = get_random_uniform
 
   def __str__(self) -> str:
       text = self.__class__.__name__ + '\n'
@@ -40,19 +52,34 @@ class Topology():
     Returns:
       check_region (cuda device function)
     '''
-    code_check_region = f'''
-    @cuda.jit(device=True)
-    def check_region(x:nb.types.float32, z:nb.types.float32,
-                      inside:nb.types.Array, 
-                      step:nb.types.uint64, 
-                      internal_state:tuple) -> None:
-      pass
-    '''
-    for i, region in enumerate(regions):
-      code_check_region+=f'''
-      if {region['def']}:
-        cuda.atomic.add(inside, ({i}, step), 1)
+    if _GPU_COMPUTATION:
+      code_check_region = f'''
+      @cuda.jit(device=True)
+      def check_region(x:nb.types.float32, z:nb.types.float32,
+                        inside:nb.types.Array, 
+                        step:nb.types.uint64, 
+                        internal_state:tuple) -> None:
+        pass
       '''
+      for i, region in enumerate(regions):
+        code_check_region+=f'''
+        if {region['def']}:
+          cuda.atomic.add(inside, ({i}, step), 1)
+        '''
+    else:
+      code_check_region = f'''
+      @jit(nopython=True)
+      def check_region(x:nb.types.float32, z:nb.types.float32,
+                        inside:nb.types.Array, 
+                        step:nb.types.uint64, 
+                        internal_state:tuple) -> None:
+        pass
+      '''
+      for i, region in enumerate(regions):
+        code_check_region+=f'''
+        if {region['def']}:
+          inside[{i}, step] += 1
+        '''
     code_check_region = textwrap.dedent(code_check_region)
     input_dict=globals()
     for key, value in self.__dict__.items() :
@@ -201,7 +228,7 @@ class InfiniteSlitAbsorbing(Topology):
           xint = t*x1 + (1-t)*x0
           zint = t*z1 + (1-t)*z0
           x1, z1 = xint, zint
-          T = -(1/l)*math.log(1-xoroshiro128p_uniform_float32(rng_states, pos))
+          T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
           internal_state[0] = uint32(T)
       
       # Intersection with top channel
@@ -214,7 +241,7 @@ class InfiniteSlitAbsorbing(Topology):
           xint = t*x1 + (1-t)*x0
           zint = t*z1 + (1-t)*z0
           x1, z1 = xint, zint
-          T = -(1/l)*math.log(1-xoroshiro128p_uniform_float32(rng_states, pos))
+          T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
           internal_state[0] = uint32(T)
 
       # Periodic boundary condition along x:
@@ -995,7 +1022,7 @@ class AbsorbingChannel1(Topology):
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = xint, zint+1
-                T = -(1/l)*math.log(1-xoroshiro128p_uniform_float32(rng_states, pos))
+                T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
                 internal_state[0] = uint32(T)
                 break
         
@@ -1011,7 +1038,7 @@ class AbsorbingChannel1(Topology):
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = xint, zint-1
-                T = -(1/l)*math.log(1-xoroshiro128p_uniform_float32(rng_states, pos))
+                T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
                 internal_state[0] = uint32(T)
                 break
                                 
