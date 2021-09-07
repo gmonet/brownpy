@@ -699,7 +699,7 @@ class ElasticChannel1(Topology):
     return fig, ax
 
 class ElasticChannel2(Topology):
-  __version__='0.0.1'
+  __version__='0.0.2'
 
   def __init__(self, 
                L: dtype, H: dtype, 
@@ -878,7 +878,7 @@ class ElasticChannel2(Topology):
     # Number of particles in channel
     N_c = N-N_R
     if N_c > 0:
-      r0_c = rng.uniform((-Lc/2, -Hc/2), (Lc/2, Hc/2), size=(N_R, 2))
+      r0_c = rng.uniform((-Lc/2, -Hc/2), (Lc/2, Hc/2), size=(N_c, 2))
       r0 = np.concatenate((r0_R, r0_c))
     else:
       r0 = r0_R

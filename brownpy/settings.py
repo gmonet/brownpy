@@ -1,6 +1,8 @@
 from numba import cuda
+_GPU_COMPUTATION = cuda.is_available()
 
 def set_computation_type(type='auto'):
+    global _GPU_COMPUTATION
     if type=='auto':
         _GPU_COMPUTATION = cuda.is_available()
     elif type=='cpu':
@@ -9,6 +11,4 @@ def set_computation_type(type='auto'):
         _GPU_COMPUTATION = True
     else:
         raise ValueError("type should be \'auto\', \'cpu\' or \'gpu\'")
-    return _GPU_COMPUTATION
 
-_GPU_COMPUTATION = set_computation_type()
