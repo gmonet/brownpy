@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 import cupy as cp
 
 from brownpy import topology
-from brownpy.utils import prefix, setDeviceArrayValue
+from brownpy.utils import prefix
 
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
@@ -411,9 +411,6 @@ class Universe():
           trajectory (float32[:,2,N_dumps]): output trajectory
         """
         dx, dz = nb.float32(0.0), nb.float32(0.0)
-        for step in range(N_steps):
-          for i in range(inside.shape[1]):
-            inside[i, step] = 0
         for pos in nb.prange(r0.shape[0]):
           x0, z0 = r0[pos, 0], r0[pos, 1]
           i_dump = 0 
