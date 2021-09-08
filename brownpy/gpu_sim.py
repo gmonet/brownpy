@@ -17,9 +17,10 @@ import cupy as cp
 from brownpy import bc
 from brownpy import topology
 from brownpy.utils import prefix
+from brownpy.settings import _GPU_COMPUTATION
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
-
+# def set_
 
 class Universe():
   """The Universe contains all the information describing the system.
@@ -182,7 +183,7 @@ class Universe():
     """str: Get path to the netcdf output path."""
     return self._output_path
   #endregion
-
+  
   def __len__(self):
     with h5py.File(self._output_path, "r") as f:
       N_runs = f['run'].attrs['N_runs']
@@ -221,6 +222,22 @@ class Universe():
     else:
       raise TypeError(f'universe indices must be integers or str, not {type(key)}')
   
+  def __str__(self) -> str:
+    text = ''
+    def visitor_func(name, node):
+      if isinstance(node, h5py.Dataset):
+        text += f'{node.name} {node.shape} {node.dtype}'
+      else:
+        print(node.name)
+        for key, val in node.attrs.items():
+          text+= f'{node.name} {key}: {val}'
+
+    with h5py.File(self.output_path, 'r') as f:
+      for key, val in f.attrs.items():
+          text = f'/{key}:{val}'
+      f.visititems(visitor_func)
+    return text
+
   def _initOutputFile(self, output_path: str, overwrite:bool):
     """Create and initialize the netcdf simulation file
     Args:
@@ -280,62 +297,111 @@ class Universe():
     compute_boundary_condition = self._top.compute_boundary_condition
     check_region = self._top.check_region
     scale = nb.float32(math.sqrt(2*self.D*self.dt))
+    if _GPU_COMPUTATION:
+      @cuda.jit
+      def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
+                _internal_states):
+        """Physical engine function compiled in CUDA to simulate pure brownian
+        motion particles.
 
-    @cuda.jit
-    def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
-               _internal_states):
-      """Physical engine function compiled in CUDA to simulate pure brownian
-      motion particles.
+        Args:
+          r0 (float32[:,2]): Initial position of particles 
+          N_steps (uint64): Number of simulation step 
+          inside (uint32[:,:]): ouput array that will store the number of particles in predefinned regions as function of time 
+          rng_states (xoroshiro128p_dtype[:]): array of RNG states
+          trajectory (float32[:,2,N_dumps]): output trajectory
+        """
+        N_dumps = trajectory.shape[2] # number of position dump
+        # freq_dumps = 0
+        # if N_dumps != 0:
+        #   freq_dumps = math.ceil(N_steps/N_dumps)
 
-      Args:
-        r0 (float32[:,2]): Initial position of particles 
-        N_steps (uint64): Number of simulation step 
-        inside (uint32[:,:]): ouput array that will store the number of particles in predefinned regions as function of time 
-        rng_states (xoroshiro128p_dtype[:]): array of RNG states
-        trajectory (float32[:,2,N_dumps]): output trajectory
-      """
-      N_dumps = trajectory.shape[2] # number of position dump
-      # freq_dumps = 0
-      # if N_dumps != 0:
-      #   freq_dumps = math.ceil(N_steps/N_dumps)
+        pos = cuda.grid(1)
+        dx, dz = nb.float32(0.0), nb.float32(0.0)
+        if pos < r0.shape[0]:
+          x0, z0 = r0[pos, 0], r0[pos, 1]
+          i_dump = 0 
 
-      pos = cuda.grid(1)
-      dx, dz = nb.float32(0.0), nb.float32(0.0)
-      if pos < r0.shape[0]:
-        x0, z0 = r0[pos, 0], r0[pos, 1]
-        i_dump = 0 
+          internal_state = cuda.local.array(1, nb.uint32)
+          for i in range(_internal_states.shape[1]):
+            internal_state[i] = _internal_states[pos, i]
 
-        internal_state = cuda.local.array(1, nb.uint32)
-        for i in range(_internal_states.shape[1]):
-          internal_state[i] = _internal_states[pos, i]
+          for step in range(N_steps):
+            dx = scale*xoroshiro128p_normal_float32(rng_states, pos)
+            dz = scale*xoroshiro128p_normal_float32(rng_states, pos)
+            x1 = x0 + dx
+            z1 = z0 + dz
 
-        for step in range(N_steps):
-          dx = scale*xoroshiro128p_normal_float32(rng_states, pos)
-          dz = scale*xoroshiro128p_normal_float32(rng_states, pos)
-          x1 = x0 + dx
-          z1 = z0 + dz
+            x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, internal_state)
+            check_region(x1, z1, inside, step, internal_state)
 
-          x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, internal_state)
-          check_region(x1, z1, inside, step, internal_state)
+            x0 = x1
+            z0 = z1
+            if freq_dumps != 0:
+              if (step + 1 + t0)%freq_dumps == 0:
+                trajectory[pos, 0, i_dump] = x0
+                trajectory[pos, 1, i_dump] = z0
+                i_dump += 1
+          r0[pos, 0] = x0
+          r0[pos, 1] = z0
 
-          x0 = x1
-          z0 = z1
-          if freq_dumps != 0:
-            if (step + 1 + t0)%freq_dumps == 0:
-              trajectory[pos, 0, i_dump] = x0
-              trajectory[pos, 1, i_dump] = z0
-              i_dump += 1
-        r0[pos, 0] = x0
-        r0[pos, 1] = z0
+          for i in range(_internal_states.shape[1]):
+            _internal_states[pos, i] = internal_state[i]
 
-        for i in range(_internal_states.shape[1]):
-           _internal_states[pos, i] = internal_state[i]
+        if pos==0:
+          t0 += N_steps
+      
+      self.engine = engine
+    else:
+      @nb.njit(parallel=True)
+      def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
+                _internal_states):
+        """Physical engine function compiled in CUDA to simulate pure brownian
+        motion particles.
 
-      if pos==0:
+        Args:
+          r0 (float32[:,2]): Initial position of particles 
+          N_steps (uint64): Number of simulation step 
+          inside (uint32[:,:]): ouput array that will store the number of particles in predefinned regions as function of time 
+          rng_states (xoroshiro128p_dtype[:]): array of RNG states
+          trajectory (float32[:,2,N_dumps]): output trajectory
+        """
+        N_dumps = trajectory.shape[2] # number of position dump
+        dx, dz = nb.float32(0.0), nb.float32(0.0)
+        for pos in nb.prange(r0.shape[0]):
+          x0, z0 = r0[pos, 0], r0[pos, 1]
+          i_dump = 0 
+
+          internal_state = np.zeros(1, dtype=nb.uint32)
+          for i in range(_internal_states.shape[1]):
+            internal_state[i] = _internal_states[pos, i]
+
+          for step in range(N_steps):
+            dx = scale*np.random.standard_normal()
+            dz = scale*np.random.standard_normal()
+            x1 = x0 + dx
+            z1 = z0 + dz
+
+            x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, internal_state)
+            check_region(x1, z1, inside, step, internal_state)
+
+            x0 = x1
+            z0 = z1
+            if freq_dumps != 0:
+              if (step + 1 + t0)%freq_dumps == 0:
+                trajectory[pos, 0, i_dump] = x0
+                trajectory[pos, 1, i_dump] = z0
+                i_dump += 1
+          r0[pos, 0] = x0
+          r0[pos, 1] = z0
+
+          for i in range(_internal_states.shape[1]):
+            _internal_states[pos, i] = internal_state[i]
+
         t0 += N_steps
-    
-    self.engine = engine
-
+      
+      self.engine = engine
+  
   def plot(self, ax=None, scatter_kwargs={'s': 0.1}):
     """Plot current position of particles
 
@@ -372,10 +438,10 @@ class Universe():
     with h5py.File(self._output_path, 'a') as f:
       runsgrp = f['run']
 
-      i = 0
-      while f'{i}' in runsgrp:
-          i += 1
-      rungrp = runsgrp.create_group(f'{i}')
+      i_run = 0
+      while f'{i_run}' in runsgrp:
+          i_run += 1
+      rungrp = runsgrp.create_group(f'{i_run}')
       rungrp.attrs['status'] = 'UNCOMPLETED'
       rungrp.attrs['step_i'] = self._step
       rungrp.attrs['step_f'] = self._step + N_steps
@@ -407,25 +473,36 @@ class Universe():
       else:
         N_dumps = 0
     
-      N_steps = nb.uint64(N_steps) # Total number of steps
+    N_steps = nb.uint64(N_steps) # Total number of steps
 
-      N_chunks = math.ceil(N_steps/max_chunk_size) # Number of chunk
-        
-      N_particles = self.N
-      D, dt = self.D, self.dt
-      dtype = self._dtype
+    N_chunks = math.ceil(N_steps/max_chunk_size) # Number of chunk
+      
+    N_particles = self.N
+    D, dt = self.D, self.dt
+    dtype = self._dtype
 
+    # Get current position of particles
+    pos = self._pos
+
+    
+
+    # Allocate memory to store internal state for each particles
+    internal_states = np.zeros((N_particles, 1), dtype=np.uint32)
+
+    # Allocate memory to store trajectory
+    N_dumps = 0 if freq_dumps==0 else math.floor(max_chunk_size/freq_dumps)
+    trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
+
+    if _GPU_COMPUTATION:
       # Transfert current position to device
-      d_pos = cuda.to_device(self._pos)
+      d_pos = cuda.to_device(pos)
       # TODO : use pinned array ?
       
       # Allocate device memory to store number of particle in regions
-      p_inside = cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
-      _internal_states = cp.zeros((N_particles, 1), dtype=np.uint32)
+      
+      d_internal_states = cuda.to_device(internal_states) # Transfert to device memory
 
-      # Allocate memory to store trajectory
-      N_dumps = 0 if freq_dumps==0 else math.floor(max_chunk_size/freq_dumps)
-      trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
+      # Allocate device memory to store trajectory
       d_trajectory = cuda.to_device(trajectory) # Transfert to device memory
 
       # Create individual random generator states for each CUDA thread 
@@ -438,62 +515,79 @@ class Universe():
       # transfertStream1 = cuda.stream()
       # transfertStream2 = cuda.stream()
       dt1, dt2, dt3 = [], [], []
-      t0_cpu = time.perf_counter()
-      pbar = tqdm(total=math.ceil(N_steps))
-      for i_chunk, i_step in enumerate(range(0, N_steps, max_chunk_size)):
-        chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
-        chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
+    else:
+      rng_states=np.zeros(N_particles, dtype=np.uint32)
 
+    t0_cpu = time.perf_counter()
+    pbar = tqdm(total=math.ceil(N_steps))
+    for i_chunk, i_step in enumerate(range(0, N_steps, max_chunk_size)):
+      chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
+      chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
+
+      if _GPU_COMPUTATION:
         e0.record()
-        p_inside=cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+        # Allocate device memory to store number of particle in regions
+        d_p_inside=cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
         e1.record()
         self.engine[self._blockspergrid, 
                     self._threadsperblock](d_pos, # r0
-                                           self._step, # t0 
-                                           chunk_size, # N_steps
-                                           p_inside, # inside 
-                                           rng_states, # rng_states
-                                           d_trajectory, # trajectory
-                                           freq_dumps, #freq_dumps
-                                           _internal_states,
-                                           )
-
+                                            self._step, # t0 
+                                            chunk_size, # N_steps
+                                            d_p_inside, # inside 
+                                            rng_states, # rng_states
+                                            d_trajectory, # trajectory
+                                            freq_dumps, #freq_dumps
+                                            d_internal_states,
+                                            )
         e2.record()
         # Transfert results from device to RAM
         # TODO : USE STREAM !!!
         if freq_dumps!=0: d_trajectory.copy_to_host(trajectory)
-        
-
-        
-        # Transfert result from RAM to drive
-        for i in range(N_regions):
-          regions_ds[i][i_step:i_step + max_chunk_size] = p_inside.get()[i, :chunk_size] # Transfert result from RAM to drive
-        if freq_dumps!=0:
-          i_N_dumps = math.floor(chunk_size/freq_dumps)
-          traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
-
-        self._step += chunk_size
+        p_inside = d_p_inside.get()
         e3.record()
         cuda.synchronize()
         dt1.append(cuda.event_elapsed_time(e0,e1)*1E-3)
         dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
         dt3.append(cuda.event_elapsed_time(e2,e3)*1E-3)
-        pbar.set_postfix(total = f'{prefix(self._step*self.dt*1E-15)}s')
-        pbar.update(chunk_size)
+      else:
+        p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+        self.engine(pos, # r0
+                    self._step, # t0 
+                    chunk_size, # N_steps
+                    p_inside, # inside 
+                    rng_states, # rng_states
+                    trajectory, # trajectory
+                    freq_dumps, #freq_dumps
+                    internal_states,
+                    )
+      # Transfert result from RAM to drive
+      with h5py.File(self._output_path, 'a') as f:
+        for i, region in enumerate(self._top.regions):
+          region_ds = f[f'run/{i_run}/regions/{region["name"]}']
+          regions_ds[i_step:i_step + max_chunk_size] = p_inside[i, :chunk_size] 
+        if freq_dumps!=0:
+          traj_ds = f[f'run/{i_run}/trajectory']
+          i_N_dumps = math.floor(chunk_size/freq_dumps)
+          traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
+
+      self._step += chunk_size
+      pbar.set_postfix(total = f'{prefix(self._step*self.dt*1E-15)}s')
+      pbar.update(chunk_size)
     pbar.close()
-    del d_trajectory, d_pos
+    if _GPU_COMPUTATION: del d_trajectory, d_pos; cuda.synchronize()
     del trajectory
-    cuda.synchronize()
     t1_cpu = time.perf_counter()
     dt_cpu = t1_cpu - t0_cpu
-    dt1, dt2, dt3 = N_chunks*np.mean(dt1), N_chunks*np.mean(dt2), N_chunks*np.mean(dt3)
+    
     print(f'With {N_particles} particles')
-    print(f'------------------------------------------')
-    print(f'GPU time per step and per particles:')
-    print(f'Allocation: {prefix(dt1/N_steps/N_particles)}s')
-    print(f'Engine: {prefix(dt2/N_steps/N_particles)}s')
-    print(f'Transfert to RAM: {prefix(dt3/N_steps/N_particles)}s')
-    print(f'Total: {prefix((dt1+dt2+dt3)/N_steps/N_particles)}s')
+    if _GPU_COMPUTATION: 
+      dt1, dt2, dt3 = N_chunks*np.mean(dt1), N_chunks*np.mean(dt2), N_chunks*np.mean(dt3)
+      print(f'------------------------------------------')
+      print(f'GPU time per step and per particles:')
+      print(f'Allocation: {prefix(dt1/N_steps/N_particles)}s')
+      print(f'Engine: {prefix(dt2/N_steps/N_particles)}s')
+      print(f'Transfert to RAM: {prefix(dt3/N_steps/N_particles)}s')
+      print(f'Total: {prefix((dt1+dt2+dt3)/N_steps/N_particles)}s')
     print(f'------------------------------------------')
     print(f'CPU time per step and per particles:')
     print(f'Total: {prefix(dt_cpu/N_steps/N_particles)}s')
