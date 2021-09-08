@@ -5,19 +5,16 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numba as nb
 import numpy as np
-from netCDF4 import Dataset
 import h5py
 from numba import cuda
 from numba.cuda.random import (create_xoroshiro128p_states,
                                xoroshiro128p_normal_float32)
-from numpy.random.mtrand import seed
 from tqdm.auto import tqdm
 import cupy as cp
 
-from brownpy import bc
 from brownpy import topology
-from brownpy.utils import prefix
-from brownpy.settings import _GPU_COMPUTATION
+from brownpy.utils import prefix, setDeviceArrayValue
+
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
 class hdf5Reader():
@@ -365,7 +362,6 @@ class Universe():
           rng_states (xoroshiro128p_dtype[:]): array of RNG states
           trajectory (float32[:,2,N_dumps]): output trajectory
         """
-
         pos = cuda.grid(1)
         dx, dz = nb.float32(0.0), nb.float32(0.0)
         if pos < r0.shape[0]:
@@ -415,6 +411,9 @@ class Universe():
           trajectory (float32[:,2,N_dumps]): output trajectory
         """
         dx, dz = nb.float32(0.0), nb.float32(0.0)
+        for step in range(N_steps):
+          for i in range(inside.shape[1]):
+            inside[i, step] = 0
         for pos in nb.prange(r0.shape[0]):
           x0, z0 = r0[pos, 0], r0[pos, 1]
           i_dump = 0 
@@ -642,7 +641,7 @@ class Universe():
       pbar.update(chunk_size)
 
     pbar.close()
-    if target == 'gpu': del d_trajectory, d_pos; cuda.synchronize()
+    if target == 'gpu': del d_trajectory, d_pos, d_p_inside; cuda.synchronize()
     del trajectory
     t1_cpu = time.perf_counter()
     dt_cpu = t1_cpu - t0_cpu
@@ -684,5 +683,5 @@ if __name__ == "__main__":
   top = topology.ElasticChannel1(L=L, h=h, R=R)
   u = Universe(N=N, top=top, D=D, dt=dt,
               output_path='simu', overwrite=True)
-  u.run(10000, freq_dumps=100)
+  u.run(10000, target='cpu')
   # u2 = Universe.from_hdf5(u.output_path)

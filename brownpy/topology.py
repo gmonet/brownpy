@@ -11,7 +11,6 @@ from numpy import array, float32, ndarray, uint, uint32
 from numba.cuda.random import xoroshiro128p_uniform_float32
 
 from brownpy import bc
-from brownpy.settings import _GPU_COMPUTATION
 
 dtype=float32
 
