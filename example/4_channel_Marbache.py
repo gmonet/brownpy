@@ -56,10 +56,10 @@ if __name__ == "__main__":
 
     # Timestep 
     dt = int(0.05*Hc**2/D)
-    N = 2*1024
+    N = 32*1024
     print(f'dt = {dt:.2e} fs = {prefix(dt*1E-15)}s')
 
-    Nsteps = int(1.5*1E6/0.05) * 0.1
+    Nsteps = int(1.5*1E6/0.05) * 10
     print(f"Number of steps : {Nsteps:.2e} = {prefix(dt*Nsteps*1E-15)}s")
 
     # Time interval for computing rolling variance
@@ -75,7 +75,7 @@ if __name__ == "__main__":
         for ar_factor in ar_factors:
             print('###############')
             print(f'{H_factor}_{ar_factor}')
-            output_path=Path(f'./4/channel/{H_factor}_{ar_factor}.hdf5')
+            output_path=Path(f'./4/channel/2/{H_factor}_{ar_factor}.hdf5')
             if output_path.exists():
                 continue
             
@@ -90,13 +90,24 @@ if __name__ == "__main__":
             u.run(Nsteps)
             time.sleep(1)
             
-            data = u[0]
-            DeltaN = (data['right'] - data['left']).astype(np.int16)
-            insideN = N-(data['right']+data['left'])
+            # data = u[0]
+            # DeltaN = (data['right'] - data['left']).astype(np.int16)
+            # insideN = N-(data['right']+data['left'])
             
-            thread = Thread(target=compute_rolling_var, 
-                            args=(intervals_dt, DeltaN, insideN, output_path))
-            thread.start()
+            # thread = Thread(target=compute_rolling_var, 
+            #                 args=(intervals_dt, DeltaN, insideN, output_path))
+            # thread.start()
             
-    for thread in threads:
-        thread.join()
+    # for thread in threads:
+    #     thread.join()
+    
+
+    # p = Path('/home/invites/gmonet/brownpy/example/4/channel/')
+    # for path in p.glob('*.hdf5'):
+    #     with h5py.File(path, 'r') as f:
+    #         array_out = np.stack((f['run/0/intervals_dt'][...], 
+    #                             f['run/0/DeltaN_rv'][...],
+    #                             f['run/0/insideN_rv'][...])).T
+
+    #     np.savetxt(path.with_suffix('.out'), array_out, delimiter=', ',
+    #             header='intervals_dt, DeltaN_rv, insideN_rv')
