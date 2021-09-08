@@ -20,7 +20,75 @@ from brownpy.utils import prefix
 from brownpy.settings import _GPU_COMPUTATION
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
-# def set_
+class hdf5Reader():
+  '''
+  Convenient class for displaying attributes and dataset stored
+  in hdf5 file 
+  '''
+  def __init__(self, path) -> None:
+    '''
+    Create a hdf5Reader object from path to hdf5 file
+
+    Args:
+      path (str or pathlib.Path): Path to hdf5 file
+    '''
+    self.path = Path(path)
+  
+  def __repr__(self) -> str:
+    '''
+    Built-in repr function to display whole content of 
+    hdf5 file.
+
+    Example:
+      >>> a = hdf5Reader(pathToHdf5File)
+      >>> a
+      /geometry/H = 100.0
+      /geometry/Hc = 100.0
+      /geometry/L = 25000.0
+      /geometry/Lc = 10000.0
+      ...
+    '''
+    text = []
+    
+    def print_attrs(name, obj): 
+      if isinstance(obj, h5py.Dataset):
+          text.append(f'{obj.name} - {obj.dtype}({obj.shape})')
+      else:
+          for key, value in obj.attrs.items():
+              text.append(f'{obj.name}/{key} = {value}')
+    with h5py.File(self.path, "r") as f:
+      for key, value in f.attrs.items():
+        text.append(f'/{key} = {value}')
+      f.visititems(print_attrs)
+    text = '\n'.join(text)
+    return text
+  
+  def __getitem__(self, key):
+    '''
+    Built-in gettter function to retrieve an attribute or
+    dataset from hdf5 file
+
+    Example:
+      >>> a = hdf5Reader(pathToHdf5File)
+      >>> a[/geometry/H]
+      100.0
+      >>> a[/geometry/H]
+      /geometry/Hc = 100.0
+      /geometry/L = 25000.0
+      /geometry/Lc = 10000.0
+      ...
+    '''
+    items_path = key.split('/')
+    parent_path = '/'.join(items_path[:-1])
+    name = items_path[-1]
+    with h5py.File(self.path, "r") as f:
+      parent_grp = f[parent_path]
+      if name in parent_grp:
+        return parent_grp[name][...]
+      elif name in parent_grp.attrs:
+        return parent_grp.attrs[name]
+      else:
+        raise ValueError(f'{key} not in hdf5 file')
 
 class Universe():
   """The Universe contains all the information describing the system.
@@ -37,7 +105,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.0.9a'
+  __version__ = '0.1.0b'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -50,13 +118,11 @@ class Universe():
     """Create a raw new Universe from topology parameters
 
     Args:
+      top (brownpy.Topology): topology object defining system boundary conditions 
       N (int): Number of particles
-      L (float in A): Length of the channel
-      h (float in A): Height of the channel
-      R (float in A): Radius of reservoirs
       D (float in A^2/fs): Diffusion coefficient
       dt (float in fs): Simulation timestep
-      output_path (str): Output netcdf file
+      output_path (str): Output hdf5 file
       overwrite (bool): if false iterate the name of output file to avoid overwriting
     kwargs (advanced parameters):
       gpu_memory (int, optional): GPU memory size to use. Default to 2*1024**3 (2GiB)
@@ -70,17 +136,15 @@ class Universe():
     # Define topology
     self._top = top
 
+    # Get topology dimension
+    # self._dim = top.dim
+
     # Define number of particles and their properties
     self._N = N
     self._D = D
     
     # Fix computation precision (TODO: make it compatible with saving in netcdf file)
     self._dtype = 'float32'
-
-    # Cut the time axis into batch of gpu-computation in order to fill the gpu memory
-    # 2GiB in default #TODO : not properly handled
-    gpu_memory = kwargs.get('gpu_memory', 2*1024**3)
-    self._batchSize = int(gpu_memory/4/2/N)  # Batch size in timestep
 
     # Thread per block (128 by default)
     self._threadsperblock = kwargs.get('threadsperblock', 128)
@@ -90,7 +154,7 @@ class Universe():
         for optimal performance""") #TODO : check if everyting work in this case
     self._blockspergrid = math.ceil(self._N / self._threadsperblock)
 
-    # Set seed if defined by user or use the system clock as seed
+    # Set seed used for sampling intial position of particles
     self._initial_seed = kwargs.get('seed', time.time_ns())
     np.random.seed(self._initial_seed%(2**32-1))
 
@@ -98,19 +162,23 @@ class Universe():
     self._pos = top.fill_geometry(N, seed=self._initial_seed)
     
     # Compile physical engine
-    self._compile()
+    self._previous_gen_settings = {}
+    # self._compile()
     
     self._output_path = output_path
     if not kwargs.get('_outputFileProvided', False):
       # Create a netcdf simulation file
       self._initOutputFile(output_path, overwrite)
-  
+    self._f = hdf5Reader(self._output_path)
+
   @classmethod
   def from_hdf5(cls, input_path: str):
     """Create Universe from hdf5 file previously created
 
     Args:
       input_path (str): hdf5 file
+    Example:
+      >>> u = Universe.from_hdf5(pathToHdf5File)
     """
 
     input_path = Path(input_path).resolve()
@@ -133,6 +201,29 @@ class Universe():
     return u
 
   #region Properties
+  @property
+  def f(self):
+    """Convenient access to attributes and dataset stored in
+    hdf5 file.
+
+    Example:
+      >>> u = Universe.from_hdf5(pathToHdf5File)
+      >>> u.f
+      /geometry/H = 100.0
+      /geometry/Hc = 100.0
+      /geometry/L = 25000.0
+      /geometry/Lc = 10000.0
+      ...
+      /particles/initial_pos - float32((2048, 2))
+      >>> u.f['/geometry/L']
+      25000.0"""
+    return self._f
+
+  @property
+  def top(self):
+    """Topology class"""
+    return self._top
+
   @property
   def pos(self):
     """array: current position of particles (in A)."""
@@ -174,54 +265,17 @@ class Universe():
     return self._dtype
 
   @property
-  def batchSize(self):
-    """int: Size of each batch along time axis used to complete GPU memory."""
-    return self._batchSize
-
-  @property
   def output_path(self):
     """str: Get path to the netcdf output path."""
     return self._output_path
   #endregion
 
   def __len__(self):
+    """Get number of simulations performed"""
     with h5py.File(self._output_path, "r") as f:
       N_runs = f['run'].attrs['N_runs']
     return N_runs
 
-  def __getitem__(self, key):
-    data = {}
-    with h5py.File(self._output_path, "r") as f:
-      groups_keys = list(f['run'])
-
-    if isinstance(key, int):
-      key = str(key)
-
-    if isinstance(key, str):
-      split = 1000
-      if key not in groups_keys:
-        raise KeyError(f"Available runs : {', '.join(groups_keys)}")
-      with h5py.File(self._output_path, "r") as f:
-        if f'run/{key}/trajectory' in f:
-          print(f'Reading trajectory ...')
-          value = f[f'run/{key}/trajectory']
-          data['trajectory'] = value[...]
-          print(f'... Done')
-        for name, value in f[f'run/{key}/regions/'].items():
-          data[name] = value[...]
-          print(f'{name}  read')
-          # TODO: Test chunck with h5py
-          # data[key] = np.empty(shape = value.shape, 
-          #                      dtype = value.dtype)
-          # if value.ndim==1: # region variable
-          #   total = value.shape[0]
-          #   pbar = tqdm(total=total)
-          #   for i in range(0, total, split):
-          #     value[i:i+split]
-      return data
-    else:
-      raise TypeError(f'universe indices must be integers or str, not {type(key)}')
-  
   def _initOutputFile(self, output_path: str, overwrite:bool):
     """Create and initialize the netcdf simulation file
     Args:
@@ -260,7 +314,7 @@ class Universe():
 
       particlesgrp = f.create_group('particles')
       particlesgrp.attrs['N'] = self.N # Specify total number of particles
-      particlesgrp.attrs['_seed'] = self._initial_seed
+      particlesgrp.attrs['initial_seed'] = self._initial_seed
       particlesgrp.create_dataset("initial_pos", data=self.pos)
       particlesgrp.create_dataset("type", data=[0]*self.N, dtype=np.uint8)
       particlegrp_0 = particlesgrp.create_group('0')
@@ -275,13 +329,29 @@ class Universe():
       rungrp = f.create_group("run")
       rungrp.attrs['N_runs'] = 0  # number of simulation perfomed until now
 
-  def _compile(self):
-    """Compile kernel cuda function
+  def _gen_engine(self, gen_settings):
+    """Create a jitted physical engine
+
+    gen_settings:
+      do_traj_dump (bool)
+      regions (list or None): if None used default top regions
+      target (str): gpu or cpu
     """
+    do_traj_dump = gen_settings['do_traj_dump']
+    target = gen_settings['target']
+    regions = gen_settings['regions']
+    self._top.gen_jitted_functions(gen_settings)
+
+    # Return engine already defined
+    if self._previous_gen_settings==gen_settings:
+      return self.engine
+
     compute_boundary_condition = self._top.compute_boundary_condition
     check_region = self._top.check_region
     scale = nb.float32(math.sqrt(2*self.D*self.dt))
-    if _GPU_COMPUTATION:
+    if target=='gpu':
+      if not cuda.is_available():
+        raise SystemError('CUDA is not availabled on this system')
       @cuda.jit
       def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
                 _internal_states):
@@ -295,10 +365,6 @@ class Universe():
           rng_states (xoroshiro128p_dtype[:]): array of RNG states
           trajectory (float32[:,2,N_dumps]): output trajectory
         """
-        N_dumps = trajectory.shape[2] # number of position dump
-        # freq_dumps = 0
-        # if N_dumps != 0:
-        #   freq_dumps = math.ceil(N_steps/N_dumps)
 
         pos = cuda.grid(1)
         dx, dz = nb.float32(0.0), nb.float32(0.0)
@@ -321,7 +387,7 @@ class Universe():
 
             x0 = x1
             z0 = z1
-            if freq_dumps != 0:
+            if do_traj_dump:
               if (step + 1 + t0)%freq_dumps == 0:
                 trajectory[pos, 0, i_dump] = x0
                 trajectory[pos, 1, i_dump] = z0
@@ -334,9 +400,7 @@ class Universe():
 
         if pos==0:
           t0 += N_steps
-      
-      self.engine = engine
-    else:
+    elif target=='cpu':
       @nb.njit(parallel=True)
       def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
                 _internal_states):
@@ -350,7 +414,6 @@ class Universe():
           rng_states (xoroshiro128p_dtype[:]): array of RNG states
           trajectory (float32[:,2,N_dumps]): output trajectory
         """
-        N_dumps = trajectory.shape[2] # number of position dump
         dx, dz = nb.float32(0.0), nb.float32(0.0)
         for pos in nb.prange(r0.shape[0]):
           x0, z0 = r0[pos, 0], r0[pos, 1]
@@ -371,7 +434,7 @@ class Universe():
 
             x0 = x1
             z0 = z1
-            if freq_dumps != 0:
+            if do_traj_dump:
               if (step + 1 + t0)%freq_dumps == 0:
                 trajectory[pos, 0, i_dump] = x0
                 trajectory[pos, 1, i_dump] = z0
@@ -383,9 +446,11 @@ class Universe():
             _internal_states[pos, i] = internal_state[i]
 
         t0 += N_steps
-      
-      self.engine = engine
-  
+    else:
+      raise ValueError('Target argument should be cpu or gpu')
+    self.engine = engine
+    self._previous_gen_settings=gen_settings
+
   def plot(self, ax=None, scatter_kwargs={'s': 0.1}):
     """Plot current position of particles
 
@@ -408,14 +473,34 @@ class Universe():
 
     return fig, ax
 
-  def run(self, N_steps, freq_dumps=0, **kwargs):
-    """Plot current position of particles
+  def run(self, N_steps, 
+          freq_dumps=0, 
+          target='auto',
+          regions=None,
+          **kwargs):
+    """Run a particle simulation
 
     Args:
-      s (float, optional): size of scatter. Default to 0.1
-      fig_kwargs (optional): Paramter to pass to plt.subplots
+      N_steps (uint): Number of simulation step
+      freq_dumps (uint, optional): Dump frequency of particles' position. 0 by default
+      target (str, optional): gpu or cpu. By default, auto (use gpu if available)
+      regions (list, optional): list of regions from which to retrieve the number of particles.
+        By default None: use the one defined in topology definition.
     """
-    
+    # Generate engin function
+    if target=='auto':
+      target = 'gpu' if cuda.is_available() else 'cpu'
+    if regions is None:
+      regions = self.top.regions
+    settings = {'target': target,
+                'regions': regions,
+                'do_traj_dump': freq_dumps>0}
+    self._gen_engine(settings)
+
+    # Cut the time axis into batch of gpu-computation in order to fill the gpu memory
+    # 2GiB in default #TODO : not properly handled
+    # gpu_memory = kwargs.get('gpu_memory', 2*1024**3)
+    # self._batchSize = int(gpu_memory/4/2/N)  # Batch size in timestep
 
     max_chunk_size = min(N_steps, 100_000) # TODO : dask ???
 
@@ -428,12 +513,14 @@ class Universe():
       rungrp = runsgrp.create_group(f'{i_run}')
       rungrp.attrs['status'] = 'UNCOMPLETED'
       rungrp.attrs['step_i'] = self._step
+      rungrp.attrs['N_steps'] = N_steps
       rungrp.attrs['step_f'] = self._step + N_steps
-      
-      N_regions = len(self._top.regions)
+      rungrp.attrs['target'] = target
+
+      N_regions = len(regions)
       regionsgrp = rungrp.create_group("regions")
       regions_ds = []
-      for region in self._top.regions:
+      for region in regions:
 
         region_ds = regionsgrp.create_dataset(region['name'], dtype=np.uint16, 
                                               shape=(N_steps,),
@@ -458,17 +545,14 @@ class Universe():
         N_dumps = 0
     
     N_steps = nb.uint64(N_steps) # Total number of steps
-
+    dt = self.dt # Timestep
+    
     N_chunks = math.ceil(N_steps/max_chunk_size) # Number of chunk
       
-    N_particles = self.N
-    D, dt = self.D, self.dt
-    dtype = self._dtype
+    N_particles = self.N # Retrieve number of particles
 
     # Get current position of particles
     pos = self._pos
-
-    
 
     # Allocate memory to store internal state for each particles
     internal_states = np.zeros((N_particles, 1), dtype=np.uint32)
@@ -477,13 +561,12 @@ class Universe():
     N_dumps = 0 if freq_dumps==0 else math.floor(max_chunk_size/freq_dumps)
     trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
 
-    if _GPU_COMPUTATION:
+    if target == 'gpu':
       # Transfert current position to device
       d_pos = cuda.to_device(pos)
       # TODO : use pinned array ?
       
       # Allocate device memory to store number of particle in regions
-      
       d_internal_states = cuda.to_device(internal_states) # Transfert to device memory
 
       # Allocate device memory to store trajectory
@@ -496,8 +579,6 @@ class Universe():
 
       # i_step = self._step 
       e0, e1, e2, e3 = cuda.event(), cuda.event(), cuda.event(), cuda.event()
-      # transfertStream1 = cuda.stream()
-      # transfertStream2 = cuda.stream()
       dt1, dt2, dt3 = [], [], []
     else:
       rng_states=np.zeros(N_particles, dtype=np.uint32)
@@ -508,7 +589,7 @@ class Universe():
       chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
       chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
 
-      if _GPU_COMPUTATION:
+      if target == 'gpu':
         e0.record()
         # Allocate device memory to store number of particle in regions
         d_p_inside=cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
@@ -529,10 +610,11 @@ class Universe():
         if freq_dumps!=0: d_trajectory.copy_to_host(trajectory)
         p_inside = d_p_inside.get()
         e3.record()
-        cuda.synchronize()
-        dt1.append(cuda.event_elapsed_time(e0,e1)*1E-3)
-        dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
-        dt3.append(cuda.event_elapsed_time(e2,e3)*1E-3)
+        if regions!=[]:
+          cuda.synchronize()
+          dt1.append(cuda.event_elapsed_time(e0,e1)*1E-3)
+          dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
+          dt3.append(cuda.event_elapsed_time(e2,e3)*1E-3)
       else:
         p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
         self.engine(pos, # r0
@@ -545,27 +627,34 @@ class Universe():
                     internal_states,
                     )
       # Transfert result from RAM to drive
-      with h5py.File(self._output_path, 'a') as f:
-        for i, region in enumerate(self._top.regions):
-          region_ds = f[f'run/{i_run}/regions/{region["name"]}']
-          regions_ds[i_step:i_step + max_chunk_size] = p_inside[i, :chunk_size] 
-        if freq_dumps!=0:
-          traj_ds = f[f'run/{i_run}/trajectory']
-          i_N_dumps = math.floor(chunk_size/freq_dumps)
-          traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
+      if regions!=[] or freq_dumps!=0:
+        with h5py.File(self._output_path, 'a') as f:
+          for i, region in enumerate(regions):
+            region_ds = f[f'run/{i_run}/regions/{region["name"]}']
+            regions_ds[i_step:i_step + max_chunk_size] = p_inside[i, :chunk_size] 
+          if freq_dumps!=0:
+            traj_ds = f[f'run/{i_run}/trajectory']
+            i_N_dumps = math.floor(chunk_size/freq_dumps)
+            traj_ds[:,:,max_dumps_per_chunk*i_chunk:max_dumps_per_chunk*(i_chunk + 1)] = trajectory[:,:,:i_N_dumps]
 
       self._step += chunk_size
-      pbar.set_postfix(total = f'{prefix(self._step*self.dt*1E-15)}s')
+      pbar.set_postfix(total = f'{prefix((i_step+chunk_size)*self.dt*1E-15)}s')
       pbar.update(chunk_size)
+
     pbar.close()
-    if _GPU_COMPUTATION: del d_trajectory, d_pos; cuda.synchronize()
+    if target == 'gpu': del d_trajectory, d_pos; cuda.synchronize()
     del trajectory
     t1_cpu = time.perf_counter()
     dt_cpu = t1_cpu - t0_cpu
-    
+    with h5py.File(self._output_path, 'a') as f:
+      f[f'run/{i_run}/'].attrs['status']='COMPLETED'
+
     print(f'With {N_particles} particles')
-    if _GPU_COMPUTATION: 
-      dt1, dt2, dt3 = N_chunks*np.mean(dt1), N_chunks*np.mean(dt2), N_chunks*np.mean(dt3)
+    if target == 'gpu': 
+      if dt1==[]:
+        dt1, dt2, dt3=0,0,0
+      else:
+        dt1, dt2, dt3 = N_chunks*np.mean(dt1), N_chunks*np.mean(dt2), N_chunks*np.mean(dt3)
       print(f'------------------------------------------')
       print(f'GPU time per step and per particles:')
       print(f'Allocation: {prefix(dt1/N_steps/N_particles)}s')
@@ -579,8 +668,6 @@ class Universe():
     print(f'For a timestep of {prefix(dt*1E-15)}s')
     print(f'To simulate the trajectory of 1 particle during 1 s, we need {prefix((dt_cpu/N_steps/N_particles)*(1E15/dt))}s')
     
-    # return True
-
 
 if __name__ == "__main__":
 

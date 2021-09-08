@@ -23,18 +23,8 @@ MAX_BOUNCE = 4
 
 class Topology():
   def __init__(self) -> None:
-      self.check_region = Topology.compile_check_region(self, self.regions)
-      if _GPU_COMPUTATION:
-        @jit(nopython=True, device=True)
-        def get_random_uniform(rng_states):
-          pos = cuda.grid(1)
-          return xoroshiro128p_uniform_float32(rng_states, pos)
-      else:
-        @jit(nopython=True)
-        def get_random_uniform(rng_states):
-          return np.random.standard_normal()
-      self.get_random_uniform = get_random_uniform
-
+    self._previous_gen_settings = {}
+    
   def __str__(self) -> str:
       text = self.__class__.__name__ + '\n'
       text+= f'version {self.__class__.__version__}\n'
@@ -43,8 +33,13 @@ class Topology():
           text += f'{key}={value}\n'
       return text
   
-  def compile_check_region(self, regions):
+  def gen_jitted_functions(self, gen_settings):
     '''
+    Genreate jitted function as a function of some settings
+    
+    settings:
+      regions (list or None): if None used default top regions
+      target (str): gpu or cpu
     Create device CUDA function from defined regions
     Args:
       regions (list of dict): Each input must be dictionnary with, at least,
@@ -52,7 +47,20 @@ class Topology():
     Returns:
       check_region (cuda device function)
     '''
-    if _GPU_COMPUTATION:
+    # If settings for generating function didn't change, we keep previously defined
+    # function
+    if gen_settings['regions'] == self._previous_gen_settings.get('regions') and \
+      gen_settings['target'] == self._previous_gen_settings.get('target'):
+      return 
+
+    target = gen_settings['target']
+    regions = gen_settings['regions']
+    if regions is None:
+      regions = self.regions
+
+    if target=='gpu':
+      if not cuda.is_available():
+        raise SystemError('CUDA is not availabled on this system')
       code_check_region = f'''
       @cuda.jit(device=True)
       def check_region(x:nb.types.float32, z:nb.types.float32,
@@ -66,7 +74,13 @@ class Topology():
         if {region['def']}:
           cuda.atomic.add(inside, ({i}, step), 1)
         '''
-    else:
+      
+      @jit(nopython=True, device=True)
+      def get_random_uniform(rng_states):
+        pos = cuda.grid(1)
+        return xoroshiro128p_uniform_float32(rng_states, pos)
+
+    elif target=='cpu':
       code_check_region = f'''
       @jit(nopython=True)
       def check_region(x:nb.types.float32, z:nb.types.float32,
@@ -80,6 +94,13 @@ class Topology():
         if {region['def']}:
           inside[{i}, step] += 1
         '''
+      
+      @jit(nopython=True)
+      def get_random_uniform(rng_states):
+        return np.random.standard_normal()
+    else:
+      raise ValueError('Target argument should be cpu or gpu')
+
     code_check_region = textwrap.dedent(code_check_region)
     input_dict=globals()
     for key, value in self.__dict__.items() :
@@ -87,7 +108,12 @@ class Topology():
           input_dict[key]=value
     return_dict={}
     exec(code_check_region, input_dict, return_dict)
-    return return_dict['check_region']
+
+    self.check_region = return_dict['check_region']
+
+    self.get_random_uniform = get_random_uniform
+
+    self._previous_gen_settings = gen_settings 
 
   def fill_geometry(self, N: uint):
     """Randomly fill the geometry
