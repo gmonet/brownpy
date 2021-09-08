@@ -15,6 +15,8 @@ import cupy as cp
 from brownpy import topology
 from brownpy.utils import prefix
 
+def pick_seed():
+  seed = time.time_ns()%(2**32-1)
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
 class hdf5Reader():
@@ -152,8 +154,8 @@ class Universe():
     self._blockspergrid = math.ceil(self._N / self._threadsperblock)
 
     # Set seed used for sampling intial position of particles
-    self._initial_seed = kwargs.get('seed', time.time_ns())
-    np.random.seed(self._initial_seed%(2**32-1))
+    self._initial_seed = kwargs.get('seed', pick_seed())
+    np.random.seed(self._initial_seed)
 
     # Fill randomly the geometry
     self._pos = top.fill_geometry(N, seed=self._initial_seed)
@@ -398,7 +400,7 @@ class Universe():
           t0 += N_steps
     elif target=='cpu':
       @nb.njit(parallel=True)
-      def engine(r0, t0, N_steps, inside, rng_states, trajectory, freq_dumps,
+      def engine(r0, t0, N_steps, inside, seeds, trajectory, freq_dumps,
                 _internal_states):
         """Physical engine function compiled in CUDA to simulate pure brownian
         motion particles.
@@ -412,6 +414,7 @@ class Universe():
         """
         dx, dz = nb.float32(0.0), nb.float32(0.0)
         for pos in nb.prange(r0.shape[0]):
+          np.random.seed(seeds[pos])
           x0, z0 = r0[pos, 0], r0[pos, 1]
           i_dump = 0 
 
@@ -425,7 +428,7 @@ class Universe():
             x1 = x0 + dx
             z1 = z0 + dz
 
-            x1, z1 = compute_boundary_condition(x0, z0, x1, z1, rng_states, internal_state)
+            x1, z1 = compute_boundary_condition(x0, z0, x1, z1, seeds, internal_state)
             check_region(x1, z1, inside, step, internal_state)
 
             x0 = x1
@@ -473,6 +476,7 @@ class Universe():
           freq_dumps=0, 
           target='auto',
           regions=None,
+          seed=None,
           **kwargs):
     """Run a particle simulation
 
@@ -493,6 +497,11 @@ class Universe():
                 'do_traj_dump': freq_dumps>0}
     self._gen_engine(settings)
 
+    # Handle seeding part
+    if seed is None:
+      seed = pick_seed()
+    np.random.seed(seed)
+
     # Cut the time axis into batch of gpu-computation in order to fill the gpu memory
     # 2GiB in default #TODO : not properly handled
     # gpu_memory = kwargs.get('gpu_memory', 2*1024**3)
@@ -512,6 +521,7 @@ class Universe():
       rungrp.attrs['N_steps'] = N_steps
       rungrp.attrs['step_f'] = self._step + N_steps
       rungrp.attrs['target'] = target
+      rungrp.attrs['seed'] = seed
 
       N_regions = len(regions)
       regionsgrp = rungrp.create_group("regions")
@@ -570,8 +580,7 @@ class Universe():
 
       # Create individual random generator states for each CUDA thread 
       # Note: max independant number generation : 2**64 (1.8E19)
-      self._initial_seed = np.uint64(kwargs.get('seed', time.time_ns())%(2**64-1))
-      rng_states = create_xoroshiro128p_states(N_particles, seed=self._initial_seed)
+      rng_states = create_xoroshiro128p_states(N_particles, seed=seed)
 
       # i_step = self._step 
       e0, e1, e2, e3 = cuda.event(), cuda.event(), cuda.event(), cuda.event()
@@ -612,16 +621,18 @@ class Universe():
           dt2.append(cuda.event_elapsed_time(e1,e2)*1E-3)
           dt3.append(cuda.event_elapsed_time(e2,e3)*1E-3)
       else:
+        seeds = np.random.randint(np.iinfo(np.uint32).max, size=N_particles, dtype=np.uint32)
         p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
         self.engine(pos, # r0
                     self._step, # t0 
                     chunk_size, # N_steps
                     p_inside, # inside 
-                    rng_states, # rng_states
+                    seeds, # seeds
                     trajectory, # trajectory
                     freq_dumps, #freq_dumps
                     internal_states,
                     )
+                    
       # Transfert result from RAM to drive
       if regions!=[] or freq_dumps!=0:
         with h5py.File(self._output_path, 'a') as f:
@@ -638,12 +649,18 @@ class Universe():
       pbar.update(chunk_size)
 
     pbar.close()
-    if target == 'gpu': del d_trajectory, d_pos, d_p_inside; cuda.synchronize()
+    if target == 'gpu': 
+      d_pos.copy_to_host(pos)
+      del d_trajectory, d_pos, d_p_inside; cuda.synchronize()
     del trajectory
+    # Transfert final position to current position
+    self._pos = pos
     t1_cpu = time.perf_counter()
     dt_cpu = t1_cpu - t0_cpu
     with h5py.File(self._output_path, 'a') as f:
       f[f'run/{i_run}/'].attrs['status']='COMPLETED'
+    
+    self._pos = pos
 
     print(f'With {N_particles} particles')
     if target == 'gpu': 
