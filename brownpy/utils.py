@@ -1,6 +1,6 @@
 import math
 import numpy as np
-
+from numba import cuda
 
 def prefix(x, dimension=1):
   """Give the number an appropriate SI prefix.
@@ -24,3 +24,17 @@ def unwrap(x, period):
   shiftx[np.where(np.diff(x) < -period/2)[0]+1] += period
   shiftx = np.cumsum(shiftx)
   return x+shiftx
+
+@cuda.jit
+def _reset_inside(inside):
+  pos = cuda.grid(1)
+  if pos<inside.shape[1]:
+      for i in range(inside.shape[0]):
+          inside[i, pos] = 0
+def reset_inside(inside):
+  '''
+  Very simple function that reset value of inside array to 0 staying inside device 
+  '''
+  threadsperblock = 32
+  blockspergrid = math.ceil(inside.shape[1]/threadsperblock)
+  _reset_inside[blockspergrid, threadsperblock](inside)

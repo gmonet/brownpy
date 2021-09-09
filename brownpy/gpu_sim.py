@@ -10,14 +10,13 @@ from numba import cuda
 from numba.cuda.random import (create_xoroshiro128p_states,
                                xoroshiro128p_normal_float32)
 from tqdm.auto import tqdm
-import cupy as cp
 
 from brownpy.topology import Topology
-from brownpy.utils import prefix
+from brownpy.utils import prefix, reset_inside
 
 
 def pick_seed():
-  seed = time.time_ns() % (2**32-1)
+  return time.time_ns() % (2**32-1)
 
 # https://sphinxcontrib-napoleon.readthedocs.io/en/latest/example_google.html
 
@@ -571,6 +570,8 @@ class Universe():
     # Allocate memory to store internal state for each particles
     internal_states = np.zeros((N_particles, 1), dtype=np.uint32)
 
+    p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+
     # Allocate memory to store trajectory
     N_dumps = 0 if freq_dumps == 0 else math.floor(max_chunk_size/freq_dumps)
     trajectory = np.zeros((N_particles, 2, N_dumps), dtype=np.float32)
@@ -586,6 +587,9 @@ class Universe():
 
       # Allocate device memory to store trajectory
       d_trajectory = cuda.to_device(trajectory)  # Transfert to device memory
+
+      # Allocate device memory to store number of particle in regions
+      d_p_inside = cuda.to_device(p_inside)
 
       # Create individual random generator states for each CUDA thread
       # Note: max independant number generation : 2**64 (1.8E19)
@@ -606,7 +610,8 @@ class Universe():
       if target == 'gpu':
         e0.record()
         # Allocate device memory to store number of particle in regions
-        d_p_inside = cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+        # d_p_inside = cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+        reset_inside(d_p_inside)
         e1.record()
         self.engine[self._blockspergrid,
                     self._threadsperblock](d_pos,  # r0
@@ -623,7 +628,8 @@ class Universe():
         # TODO : USE STREAM !!!
         if freq_dumps != 0:
           d_trajectory.copy_to_host(trajectory)
-        p_inside = d_p_inside.get()
+        # p_inside = d_p_inside.get()
+        d_p_inside.copy_to_device(p_inside)
         e3.record()
         if regions != []:
           cuda.synchronize()
@@ -633,7 +639,7 @@ class Universe():
       else:
         seeds = np.random.randint(
             np.iinfo(np.uint32).max, size=N_particles, dtype=np.uint32)
-        p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+
         self.engine(pos,  # r0
                     self._step,  # t0
                     chunk_size,  # N_steps

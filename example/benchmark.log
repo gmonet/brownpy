@@ -1,8 +1,8 @@
-/date = Created Wed Sep  8 16:24:09 2021
+/date = Created Thu Sep  9 11:33:22 2021
 /dt = 1000000
 /dtype = float32
 /ndim = 2
-/source = Created with BM_cuda
+/source = Created with brownpy
 /units = real
 /version = 0.1.0b
 /geometry/L = 1000.0
@@ -11,7 +11,7 @@
 /geometry/name = ElasticChannel1
 /geometry/version = 0.0.5
 /particles/N = 4096
-/particles/initial_seed = 1631111049643434200
+/particles/initial_seed = 1
 /particles/0/D = 0.00015
 /particles/0/type = 0
 /particles/initial_pos - float32((4096, 2))
@@ -31,6 +31,6 @@ Speed: 1.27 ns/dt/p
 CPU
 Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz
 Cores : 8
-Speed: 20.86 ns/dt/p
-Speed: 166.89 ns/dt/p/cores
-GPU = 131.117534 CPU core
+Speed: 19.39 ns/dt/p
+Speed: 155.15 ns/dt/p/core
+GPU = 122 CPU core

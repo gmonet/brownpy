@@ -35,7 +35,7 @@ if __name__ == '__main__':
 
     top = Top.ElasticChannel1(L=L, h=h, R=R)
     u = Universe(N=N, top=top, D=D, dt=dt,
-                output_path='bench', overwrite=True)
+                output_path='bench', overwrite=True, seed=1)
     log += u.f.__repr__() + '\n'
 
     
@@ -48,9 +48,9 @@ if __name__ == '__main__':
         with Capturing() as output:
             cuda.detect()
         log += '\n'.join(output) + '\n'
-        u.run(1000, target='gpu') # warmup
+        u.run(1000, target='gpu', seed=1) # warmup
         t0 = time.perf_counter_ns()
-        u.run(N_steps, target='gpu')
+        u.run(N_steps, target='gpu', seed=1)
         t1 = time.perf_counter_ns()
         dt_gpu = t1 - t0
         log += f'Speed: {dt_gpu/N/N_steps:.2f} ns/dt/p\n'
@@ -61,9 +61,9 @@ if __name__ == '__main__':
     n_cores = cpuinfo.get_cpu_info()["count"]
     log += f'{brand}\n'
     log += f'Cores : {n_cores}\n'
-    u.run(1000, target='cpu') # warmup
+    u.run(1000, target='cpu', seed=1) # warmup
     t0 = time.perf_counter_ns()
-    u.run(N_steps, target='cpu')
+    u.run(N_steps, target='cpu', seed=1)
     dt = time.perf_counter_ns() - t0
     log += f'Speed: {dt/N/N_steps:.2f} ns/dt/p\n'
     log += f'Speed: {dt/N/N_steps*n_cores:.2f} ns/dt/p/core\n'
