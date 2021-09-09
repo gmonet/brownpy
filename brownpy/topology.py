@@ -4,47 +4,41 @@ import textwrap
 
 import h5py
 import matplotlib.pyplot as plt
-import numba as nb
 import numpy as np
-from numba import jit, cuda
 from numpy import array, float32, ndarray, uint, uint32
+import numba as nb
+from numba import cuda, jit
 from numba.cuda.random import xoroshiro128p_uniform_float32
 
-from brownpy import bc
-from brownpy.settings import _GPU_COMPUTATION
 
-dtype=float32
+from brownpy import bc
+
+dtype = float32
 
 # Maximum bounce during one step
-# It may happen that the elastic bounce of a particle lead it to another wall    
+# It may happen that the elastic bounce of a particle lead it to another wall
 MAX_BOUNCE = 4
-
 
 
 class Topology():
   def __init__(self) -> None:
-      self.check_region = Topology.compile_check_region(self, self.regions)
-      if _GPU_COMPUTATION:
-        @jit(nopython=True, device=True)
-        def get_random_uniform(rng_states):
-          pos = cuda.grid(1)
-          return xoroshiro128p_uniform_float32(rng_states, pos)
-      else:
-        @jit(nopython=True)
-        def get_random_uniform(rng_states):
-          return np.random.standard_normal()
-      self.get_random_uniform = get_random_uniform
+    self._previous_gen_settings = {}
 
   def __str__(self) -> str:
-      text = self.__class__.__name__ + '\n'
-      text+= f'version {self.__class__.__version__}\n'
-      for key, value in self.__dict__.items() :
-        if isinstance(value, (bool, int, float, str)):
-          text += f'{key}={value}\n'
-      return text
-  
-  def compile_check_region(self, regions):
+    text = self.__class__.__name__ + '\n'
+    text += f'version {self.__class__.__version__}\n'
+    for key, value in self.__dict__.items():
+      if isinstance(value, (bool, int, float, str)):
+        text += f'{key}={value}\n'
+    return text
+
+  def gen_jitted_functions(self, gen_settings):
     '''
+    Genreate jitted function as a function of some settings
+
+    settings:
+      regions (list or None): if None used default top regions
+      target (str): gpu or cpu
     Create device CUDA function from defined regions
     Args:
       regions (list of dict): Each input must be dictionnary with, at least,
@@ -52,7 +46,20 @@ class Topology():
     Returns:
       check_region (cuda device function)
     '''
-    if _GPU_COMPUTATION:
+    # If settings for generating function didn't change, we keep previously defined
+    # function
+    if gen_settings['regions'] == self._previous_gen_settings.get('regions') and \
+            gen_settings['target'] == self._previous_gen_settings.get('target'):
+      return
+
+    target = gen_settings['target']
+    regions = gen_settings['regions']
+    if regions is None:
+      regions = self.regions
+
+    if target == 'gpu':
+      if not cuda.is_available():
+        raise SystemError('CUDA is not availabled on this system')
       code_check_region = f'''
       @cuda.jit(device=True)
       def check_region(x:nb.types.float32, z:nb.types.float32,
@@ -62,11 +69,17 @@ class Topology():
         pass
       '''
       for i, region in enumerate(regions):
-        code_check_region+=f'''
+        code_check_region += f'''
         if {region['def']}:
           cuda.atomic.add(inside, ({i}, step), 1)
         '''
-    else:
+
+      @jit(nopython=True, device=True)
+      def get_random_uniform(rng_states):
+        pos = cuda.grid(1)
+        return xoroshiro128p_uniform_float32(rng_states, pos)
+
+    elif target == 'cpu':
       code_check_region = f'''
       @jit(nopython=True)
       def check_region(x:nb.types.float32, z:nb.types.float32,
@@ -76,18 +89,30 @@ class Topology():
         pass
       '''
       for i, region in enumerate(regions):
-        code_check_region+=f'''
+        code_check_region += f'''
         if {region['def']}:
           inside[{i}, step] += 1
         '''
+
+      @jit(nopython=True)
+      def get_random_uniform(rng_states):
+        return np.random.standard_normal()
+    else:
+      raise ValueError('Target argument should be cpu or gpu')
+
     code_check_region = textwrap.dedent(code_check_region)
-    input_dict=globals()
-    for key, value in self.__dict__.items() :
-        if isinstance(value, (bool, int, float, str)):
-          input_dict[key]=value
-    return_dict={}
+    input_dict = globals()
+    for key, value in self.__dict__.items():
+      if isinstance(value, (bool, int, float, str)):
+        input_dict[key] = value
+    return_dict = {}
     exec(code_check_region, input_dict, return_dict)
-    return return_dict['check_region']
+
+    self.check_region = return_dict['check_region']
+
+    self.get_random_uniform = get_random_uniform
+
+    self._previous_gen_settings = gen_settings
 
   def fill_geometry(self, N: uint):
     """Randomly fill the geometry
@@ -97,7 +122,7 @@ class Topology():
   def to_hdf5(self, geom_grp: h5py.Group):
     geom_grp.attrs['name'] = self.__class__.__name__
     geom_grp.attrs['version'] = self.__class__.__version__
-    for key, value in self.__dict__.items() :
+    for key, value in self.__dict__.items():
       if isinstance(value, (bool, int, float, str)):
         geom_grp.attrs[key] = value
 
@@ -106,28 +131,30 @@ class Topology():
     dic = geom_grp.attrs
     return cls(**dic)
 
-  def compute_boundary_condition(self, 
-                                 x0:dtype, z0:dtype, 
-                                 x1:dtype, z1:dtype,
-                                 rng_states:array, 
-                                 internal_state:tuple):
+  def compute_boundary_condition(self,
+                                 x0: dtype, z0: dtype,
+                                 x1: dtype, z1: dtype,
+                                 rng_states: array,
+                                 internal_state: tuple):
     raise NotImplementedError
 
   def check_region(self,
-                   x:dtype, z:dtype,
-                   inside:nb.types.Array, 
-                   step:nb.types.uint64, 
-                   internal_state:tuple) -> None:
+                   x: dtype, z: dtype,
+                   inside: nb.types.Array,
+                   step: nb.types.uint64,
+                   internal_state: tuple) -> None:
     raise NotImplementedError
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     raise NotImplementedError
-  
+
   def plot(self, ax=None):
     raise NotImplementedError
 
+
 class Infinite(Topology):
-  __version__='0.0.1'
+  __version__ = '0.0.1'
+
   def __init__(self, **kwargs) -> None:
     """Jut inifinite space without any walls
     Args:
@@ -136,15 +163,15 @@ class Infinite(Topology):
       seed (int): set seed
     """
     regions = []
-    regions = [{'name':'left', 'def':'x<=0'}]
+    regions = [{'name': 'left', 'def': 'x<=0'}]
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
@@ -176,8 +203,10 @@ class Infinite(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
+
 class InfiniteSlitAbsorbing(Topology):
-  __version__='0.0.1'
+  __version__ = '0.0.1'
+
   def __init__(self, L: dtype, h: dtype, l: float, **kwargs) -> None:
     """Inifinite slit with absorbing walls
 
@@ -201,15 +230,15 @@ class InfiniteSlitAbsorbing(Topology):
     """
     self.L, self.h = L, h
     self.l = l
-    regions = [{'name':'absorbed', 'def':'internal_state[0] > 0'}]
+    regions = [{'name': 'absorbed', 'def': 'internal_state[0] > 0'}]
     self.regions = regions
-    
-    ## Geometrical parameters are treated as constants during the compilation
+
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       pos = cuda.grid(1)
 
       if internal_state[0] != 0:
@@ -217,26 +246,26 @@ class InfiniteSlitAbsorbing(Topology):
         x1 = x0
         z1 = z0
         return x1, z1
-        
+
       # Intersection with bottom channel
       X, Z = 0, -h/2
       NX, NZ = 0, 1
-      if z1<Z:
+      if z1 < Z:
         den = (x1-x0)*NX + (z1-z0)*NZ
-        if den!=0:
+        if den != 0:
           t = ((X-x0)*NX + (Z-z0)*NZ)/den
           xint = t*x1 + (1-t)*x0
           zint = t*z1 + (1-t)*z0
           x1, z1 = xint, zint
           T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
           internal_state[0] = uint32(T)
-      
+
       # Intersection with top channel
       X, Z = 0, +h/2
       NX, NZ = 0, 1
-      if z1>Z:
+      if z1 > Z:
         den = (x1-x0)*NX + (z1-z0)*NZ
-        if den!=0:
+        if den != 0:
           t = ((X-x0)*NX + (Z-z0)*NZ)/den
           xint = t*x1 + (1-t)*x0
           zint = t*z1 + (1-t)*z0
@@ -245,7 +274,7 @@ class InfiniteSlitAbsorbing(Topology):
           internal_state[0] = uint32(T)
 
       # Periodic boundary condition along x:
-      x1 = (L/2 + x1)%(L) - L/2
+      x1 = (L/2 + x1) % (L) - L/2
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
@@ -289,8 +318,10 @@ class InfiniteSlitAbsorbing(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
+
 class Periodic(Topology):
-  __version__='0.0.1'
+  __version__ = '0.0.1'
+
   def __init__(self, L: dtype, **kwargs) -> None:
     """Jut periodic box without any walls
 
@@ -303,7 +334,7 @@ class Periodic(Topology):
     └┈┈┈┈┈┈┈┈┈┈┈┈┈┘ 🡓
      ←-----------→
             L   
-    
+
     ┊ : Periodic condition
 
     Args:
@@ -315,15 +346,15 @@ class Periodic(Topology):
     regions = []
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       # Periodic condition
-      x1 = (L/2 + x1)%(L) - L/2
-      z1 = (L/2 + z1)%(L) - L/2
+      x1 = (L/2 + x1) % (L) - L/2
+      z1 = (L/2 + z1) % (L) - L/2
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
@@ -363,8 +394,8 @@ class Periodic(Topology):
 
     # Draw geometry
 
-    ax.plot([-L/2, -L/2, L/2,  L/2], 
-            [-L/2,  L/2, L/2, -L/2], 
+    ax.plot([-L/2, -L/2, L/2,  L/2],
+            [-L/2,  L/2, L/2, -L/2],
             **border_kwargs)
 
     ax.set_xlabel('x [Å]')
@@ -373,8 +404,10 @@ class Periodic(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
+
 class ElasticPore1(Topology):
-  __version__='0.0.3'
+  __version__ = '0.0.3'
+
   def __init__(self, Lm: dtype, L: dtype, R: dtype, **kwargs) -> None:
     """Simple elastic Pore
     Geometry inspired from Marbach 2020
@@ -389,7 +422,7 @@ class ElasticPore1(Topology):
     ┃         ┃         ┃     
      ←-----------------→
               L   
-    
+
     ┃ : Elastic wall
 
     Args:
@@ -402,37 +435,37 @@ class ElasticPore1(Topology):
     self.Lm = Lm
     self.L = L
     self.R = R
-    regions = [{'name':'left', 'def':'x<=0'}]
+    regions = [{'name': 'left', 'def': 'x<=0'}]
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
-      #Intersection with left wall
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
+      # Intersection with left wall
       X, Z = -L/2, 0
       NX, NZ = 1, 0
-      if x1<X:
+      if x1 < X:
         x1 = x1+2*(X-x1)
 
       # Intersection with membrane
       X, Z = 0, 0
       NX, NZ = 1, 0
-      if x0*x1<=0 and x1!=x0:
+      if x0*x1 <= 0 and x1 != x0:
         t = (X-x0)/(x1-x0)
         zint = t*z1 + (1-t)*z0
-        if math.fabs(zint)>R:
+        if math.fabs(zint) > R:
           x1 *= -1
-                              
-      #Intersection with right wall
+
+      # Intersection with right wall
       X, Z = +L/2, 0
       NX, NZ = 1, 0
-      if x1>X:
+      if x1 > X:
         x1 = x1+2*(X-x1)
-      
-      z1 = (Lm + z1)%(2*Lm) - Lm
+
+      z1 = (Lm + z1) % (2*Lm) - Lm
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
@@ -481,7 +514,7 @@ class ElasticPore1(Topology):
     # Draw geometry
 
     ax.plot([-L/2, -L/2], [-Lm, +Lm], **border_kwargs)
-    ax.plot([ L/2,  L/2], [-Lm, +Lm], **border_kwargs)
+    ax.plot([L/2,  L/2], [-Lm, +Lm], **border_kwargs)
 
     ax.plot([0, 0], [R, Lm], **border_kwargs)
     ax.plot([0, 0], [-R, -Lm], **border_kwargs)
@@ -491,8 +524,10 @@ class ElasticPore1(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
+
 class ElasticChannel1(Topology):
-  __version__='0.0.5'
+  __version__ = '0.0.5'
+
   def __init__(self, L: dtype, h: dtype, R: dtype, **kwargs) -> None:
     """Create a new channel geometry
 
@@ -505,7 +540,7 @@ class ElasticChannel1(Topology):
     ┃         ┃   ┃         ┃     ↓
      ←-------→ ←-→ ←-------→
         R       L     R  
-    
+
     ┃ : Elastic wall
 
     Args:
@@ -519,15 +554,15 @@ class ElasticChannel1(Topology):
     self.L = L
     self.h = h
     self.R = R
-    regions = [{'name':'left', 'def':'x<=0'}]
+    regions = [{'name': 'left', 'def': 'x<=0'}]
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       toCheck = True
       i_BOUNCE = 0
       while toCheck and i_BOUNCE < MAX_BOUNCE:
@@ -535,16 +570,16 @@ class ElasticChannel1(Topology):
         if i_BOUNCE > 4:
           x1 = (x0+x1)/2
           z1 = (z0+z1)/2
-        
+
         # Fast skip if trajectory stay in reservoirs
-        if (math.fabs(x1)<R+L/2) and (math.fabs(x1)>L/2) and \
-           (math.fabs(x0)<R+L/2) and (math.fabs(x0)>L/2):
-           break
-        
-        #Intersection with left wall
+        if (math.fabs(x1) < R+L/2) and (math.fabs(x1) > L/2) and \
+           (math.fabs(x0) < R+L/2) and (math.fabs(x0) > L/2):
+          break
+
+        # Intersection with left wall
         X, Z = -R-L/2, 0
         NX, NZ = 1, 0
-        if x1<X:
+        if x1 < X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
@@ -554,92 +589,89 @@ class ElasticChannel1(Topology):
         # Intersection with left membrane
         X, Z = -L/2, 0
         NX, NZ = 1, 0
-        if x0<X:
+        if x0 < X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > h/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with bottom channel
         X, Z = 0, -h/2
         NX, NZ = 0, 1
-        if z0>Z:
+        if z0 > Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 toCheck = True
                 continue
-        
+
         # Intersection with top channel
         X, Z = 0, +h/2
         NX, NZ = 0, 1
-        if z0<Z:
+        if z0 < Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 toCheck = True
                 continue
-                                
+
         # Intersection with right membrane
         X, Z = +L/2, 0
         NX, NZ = 1, 0
-        if x0>X:
+        if x0 > X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > h/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with right wall
         X, Z = +R+L/2, 0
         NX, NZ = 1, 0
-        if x1>X:
+        if x1 > X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
                                        NX, NZ)
           break
-        
-        
 
-        
         i_BOUNCE += 1
         # if i_BOUNCE>=MAX_BOUNCE-2:
         #   print(pos, i_BOUNCE, x0, z0, x1, z1)
-      
+
       # Periodic boundary condition along z:
-      z1 = (R + z1)%(2*R) - R
+      z1 = (R + z1) % (2*R) - R
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
@@ -684,7 +716,7 @@ class ElasticChannel1(Topology):
     # Draw geometry
 
     ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
-    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
+    ax.plot([+L/2+R,  L/2+R], [-R, +R], **border_kwargs)
 
     ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
     ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
@@ -698,11 +730,12 @@ class ElasticChannel1(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
-class ElasticChannel2(Topology):
-  __version__='0.0.2'
 
-  def __init__(self, 
-               L: dtype, H: dtype, 
+class ElasticChannel2(Topology):
+  __version__ = '0.0.2'
+
+  def __init__(self,
+               L: dtype, H: dtype,
                Lc: dtype, Hc: dtype, **kwargs) -> None:
     """Create a new channel geometry
 
@@ -729,17 +762,17 @@ class ElasticChannel2(Topology):
     """
     self.L, self.H = L, H
     self.Lc, self.Hc = Lc, Hc
-    regions = [{'name':'left',  'def':'x<=-Lc/2'},
-               {'name':'right', 'def':'x>=Lc/2'}]
+    regions = [{'name': 'left',  'def': 'x<=-Lc/2'},
+               {'name': 'right', 'def': 'x>=Lc/2'}]
     # regions=[]
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       toCheck = True
       i_BOUNCE = 0
       while toCheck and i_BOUNCE < MAX_BOUNCE:
@@ -747,16 +780,16 @@ class ElasticChannel2(Topology):
         if i_BOUNCE > 4:
           x1 = (x0+x1)/2
           z1 = (z0+z1)/2
-        
+
         # Fast skip if trajectory stay in reservoirs
-        if (math.fabs(x1)<L+Lc/2) and (math.fabs(x1)>L/2) and \
-           (math.fabs(x0)<L+Lc/2) and (math.fabs(x0)>L/2):
-           break
-        
-        #Intersection with left wall
+        if (math.fabs(x1) < L+Lc/2) and (math.fabs(x1) > L/2) and \
+           (math.fabs(x0) < L+Lc/2) and (math.fabs(x0) > L/2):
+          break
+
+        # Intersection with left wall
         X, Z = -L-Lc/2, 0
         NX, NZ = 1, 0
-        if x1<X:
+        if x1 < X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
@@ -766,90 +799,89 @@ class ElasticChannel2(Topology):
         # Intersection with left membrane
         X, Z = -Lc/2, 0
         NX, NZ = 1, 0
-        if x0<X and x1>X:
+        if x0 < X and x1 > X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > Hc/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with bottom channel
         X, Z = 0, -Hc/2
         NX, NZ = 0, 1
-        if z0>Z and z1<Z:
+        if z0 > Z and z1 < Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < Lc/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 toCheck = True
                 continue
-        
+
         # Intersection with top channel
         X, Z = 0, +Hc/2
         NX, NZ = 0, 1
-        if z0<Z and z1>Z:
+        if z0 < Z and z1 > Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < Lc/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 toCheck = True
                 continue
-                                
+
         # Intersection with right membrane
         X, Z = +Lc/2, 0
         NX, NZ = 1, 0
-        if x0>X and x1<X:
+        if x0 > X and x1 < X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > Hc/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with right wall
         X, Z = +L+Lc/2, 0
         NX, NZ = 1, 0
-        if x1>X:
+        if x1 > X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
                                        NX, NZ)
           break
-        
-      
+
         i_BOUNCE += 1
         # if i_BOUNCE>=MAX_BOUNCE-2:
         #   print(pos, i_BOUNCE, x0, z0, x1, z1)
-      
+
       # Periodic boundary condition along z:
-      z1 = (H + z1)%(2*H) - H
+      z1 = (H + z1) % (2*H) - H
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
@@ -885,9 +917,9 @@ class ElasticChannel2(Topology):
 
     return r0.astype(dtype)
 
-  def plot(self, ax=None, 
-           border_kwargs={'elastic':{'c': 'r'},
-                          'periodic':{'c': 'r', 'ls': '--'}
+  def plot(self, ax=None,
+           border_kwargs={'elastic': {'c': 'r'},
+                          'periodic': {'c': 'r', 'ls': '--'}
                           }):
     if ax is None:
       fig, ax = plt.subplots()
@@ -921,8 +953,10 @@ class ElasticChannel2(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
+
 class AbsorbingChannel1(Topology):
-  __version__='0.0.4'
+  __version__ = '0.0.4'
+
   def __init__(self, L: dtype, h: dtype, R: dtype, l: float, **kwargs) -> None:
     """Create a new channel geometry with absorbing wall
 
@@ -935,7 +969,7 @@ class AbsorbingChannel1(Topology):
     ┃         ┃   ┃         ┃     ↓
      ←-------→ ←-→ ←-------→
         R       L     R
-    
+
     ┃ : Elastic wall
     ═ : Absorbing wall
 
@@ -952,16 +986,16 @@ class AbsorbingChannel1(Topology):
     self.h = h
     self.R = R
     self.l = l
-    regions = [{'name':'left', 'def':'x<=0'},
-               {'name':'absorbed', 'def':'internal_state[0] > 0'}]
+    regions = [{'name': 'left', 'def': 'x<=0'},
+               {'name': 'absorbed', 'def': 'internal_state[0] > 0'}]
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @cuda.jit(device=True)
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       pos = cuda.grid(1)
       toCheck = True
       i_BOUNCE = 0
@@ -971,22 +1005,22 @@ class AbsorbingChannel1(Topology):
         x1 = x0
         z1 = z0
         return x1, z1
-        
+
       while toCheck and i_BOUNCE < MAX_BOUNCE:
         toCheck = False
         if i_BOUNCE > 4:
           x1 = (x0+x1)/2
           z1 = (z0+z1)/2
-        
+
         # Fast skip if trajectory stay in reservoirs
-        if (math.fabs(x1)<R+L/2) and (math.fabs(x1)>L/2) and \
-           (math.fabs(x0)<R+L/2) and (math.fabs(x0)>L/2):
-           break
-        
-        #Intersection with left wall
+        if (math.fabs(x1) < R+L/2) and (math.fabs(x1) > L/2) and \
+           (math.fabs(x0) < R+L/2) and (math.fabs(x0) > L/2):
+          break
+
+        # Intersection with left wall
         X, Z = -R-L/2, 0
         NX, NZ = 1, 0
-        if x1<X:
+        if x1 < X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
@@ -996,28 +1030,28 @@ class AbsorbingChannel1(Topology):
         # Intersection with left membrane
         X, Z = -L/2, 0
         NX, NZ = 1, 0
-        if x0<X:
+        if x0 < X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > h/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with bottom channel
         X, Z = 0, -h/2
         NX, NZ = 0, 1
-        if z0>Z:
+        if z0 > Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
@@ -1025,15 +1059,15 @@ class AbsorbingChannel1(Topology):
                 T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
                 internal_state[0] = uint32(T)
                 break
-        
+
         # Intersection with top channel
         X, Z = 0, +h/2
         NX, NZ = 0, 1
-        if z0<Z:
+        if z0 < Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
@@ -1041,49 +1075,46 @@ class AbsorbingChannel1(Topology):
                 T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
                 internal_state[0] = uint32(T)
                 break
-                                
+
         # Intersection with right membrane
         X, Z = +L/2, 0
         NX, NZ = 1, 0
-        if x0>X:
+        if x0 > X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > h/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with right wall
         X, Z = +R+L/2, 0
         NX, NZ = 1, 0
-        if x1>X:
+        if x1 > X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
                                        NX, NZ)
           break
-        
-        
 
-        
         i_BOUNCE += 1
         # if i_BOUNCE>=MAX_BOUNCE-2:
         #   print(pos, i_BOUNCE, x0, z0, x1, z1)
-      
+
       # Periodic boundary condition along z:
-      z1 = (R + z1)%(2*R) - R
+      z1 = (R + z1) % (2*R) - R
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
 
     super().__init__()
-    
+
   def to_hdf5(self, geom_grp: h5py.Group):
     super().to_hdf5(geom_grp)
 
@@ -1146,7 +1177,7 @@ class AbsorbingChannel1(Topology):
     # Draw geometry
 
     ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
-    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
+    ax.plot([+L/2+R,  L/2+R], [-R, +R], **border_kwargs)
 
     ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
     ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
@@ -1160,8 +1191,10 @@ class AbsorbingChannel1(Topology):
     ax.set_aspect('equal')
     return fig, ax
 
+
 class SpeedElasticChannel1_dev(Topology):
-  __version__='0.0.1'
+  __version__ = '0.0.1'
+
   def __init__(self, L: dtype, h: dtype, R: dtype, **kwargs) -> None:
     """Create a new channel geometry
 
@@ -1174,7 +1207,7 @@ class SpeedElasticChannel1_dev(Topology):
     ┃         ┃   ┃         ┃     ↓
      ←-------→ ←-→ ←-------→
         R       L     R  
-    
+
     ┃ : Elastic wall
 
     Args:
@@ -1191,12 +1224,12 @@ class SpeedElasticChannel1_dev(Topology):
     regions = []
     self.regions = regions
 
-    ## Geometrical parameters are treated as constants during the compilation
+    # Geometrical parameters are treated as constants during the compilation
     @jit
-    def compute_boundary_condition(x0:dtype, z0:dtype, 
-                                   x1:dtype, z1:dtype,
-                                   rng_states:array,
-                                   internal_state:tuple):
+    def compute_boundary_condition(x0: dtype, z0: dtype,
+                                   x1: dtype, z1: dtype,
+                                   rng_states: array,
+                                   internal_state: tuple):
       toCheck = True
       i_BOUNCE = 0
       while toCheck and i_BOUNCE < MAX_BOUNCE:
@@ -1204,16 +1237,16 @@ class SpeedElasticChannel1_dev(Topology):
         if i_BOUNCE > 4:
           x1 = (x0+x1)/2
           z1 = (z0+z1)/2
-        
+
         # Fast skip if trajectory stay in reservoirs
-        if (math.fabs(x1)<R+L/2) and (math.fabs(x1)>L/2) and \
-           (math.fabs(x0)<R+L/2) and (math.fabs(x0)>L/2):
-           break
-        
-        #Intersection with left wall
+        if (math.fabs(x1) < R+L/2) and (math.fabs(x1) > L/2) and \
+           (math.fabs(x0) < R+L/2) and (math.fabs(x0) > L/2):
+          break
+
+        # Intersection with left wall
         X, Z = -R-L/2, 0
         NX, NZ = 1, 0
-        if x1<X:
+        if x1 < X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
@@ -1223,92 +1256,89 @@ class SpeedElasticChannel1_dev(Topology):
         # Intersection with left membrane
         X, Z = -L/2, 0
         NX, NZ = 1, 0
-        if x0<X:
+        if x0 < X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > h/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with bottom channel
         X, Z = 0, -h/2
         NX, NZ = 0, 1
-        if z0>Z:
+        if z0 > Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 toCheck = True
                 continue
-        
+
         # Intersection with top channel
         X, Z = 0, +h/2
         NX, NZ = 0, 1
-        if z0<Z:
+        if z0 < Z:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 toCheck = True
                 continue
-                                
+
         # Intersection with right membrane
         X, Z = +L/2, 0
         NX, NZ = 1, 0
-        if x0>X:
+        if x0 > X:
           den = (x1-x0)*NX + (z1-z0)*NZ
-          if den!=0:
+          if den != 0:
             t = ((X-x0)*NX + (Z-z0)*NZ)/den
-            if (t>0) and (t<1):
+            if (t > 0) and (t < 1):
               xint = t*x1 + (1-t)*x0
               zint = t*z1 + (1-t)*z0
               if math.fabs(zint) > h/2:
                 x1, z1 = bc.ReflectIntoPlane(x0, z0,
-                                       x1, z1,
-                                       X, Z,
-                                       NX, NZ)
+                                             x1, z1,
+                                             X, Z,
+                                             NX, NZ)
                 break
 
         # Intersection with right wall
         X, Z = +R+L/2, 0
         NX, NZ = 1, 0
-        if x1>X:
+        if x1 > X:
           x1, z1 = bc.ReflectIntoPlane(x0, z0,
                                        x1, z1,
                                        X, Z,
                                        NX, NZ)
           break
-        
-        
 
-        
         i_BOUNCE += 1
         # if i_BOUNCE>=MAX_BOUNCE-2:
         #   print(pos, i_BOUNCE, x0, z0, x1, z1)
-      
+
       # Periodic boundary condition along z:
-      z1 = (R + z1)%(2*R) - R
+      z1 = (R + z1) % (2*R) - R
 
       return x1, z1
     self.compute_boundary_condition = compute_boundary_condition
@@ -1372,7 +1402,7 @@ class SpeedElasticChannel1_dev(Topology):
     # Draw geometry
 
     ax.plot([-L/2-R, -L/2-R], [-R, +R], **border_kwargs)
-    ax.plot([ L/2+R,  L/2+R], [-R, +R], **border_kwargs)
+    ax.plot([+L/2+R,  L/2+R], [-R, +R], **border_kwargs)
 
     ax.plot([-L/2, -L/2], [R, h/2], **border_kwargs)
     ax.plot([+L/2, +L/2], [R, h/2], **border_kwargs)
