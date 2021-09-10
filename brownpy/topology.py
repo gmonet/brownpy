@@ -1437,7 +1437,7 @@ class TDElasticChannel(Topology):
     self.L, self.H = L, H
     self.Lc, self.Hc, self.Rc = Lc, Hc, Rc
     regions = [
-              # {'name': 'inside',  'def': 'x<=0 and x>=Hc and math.abs(z)<=Lc'},
+               {'name': 'inside','def': 'x<=0 and x>=-Hc and math.fabs(z)<=Lc'},
                {'name': 'after', 'def': 'x>=0'}]
     # regions=[]
     self.regions = regions
@@ -1457,11 +1457,14 @@ class TDElasticChannel(Topology):
         if i_BOUNCE > 4:
           r1 = vector2D.mean(r0, r1)
 
-        # Fast skip if trajectory stay in reservoirs
-        # Before channel
-        # if r0[0]>=0 and r1[0]>=0 and r1[0]<=H : break
-        # # After channel
-        # if r0[0]<=Hc and r1[0]<=Hc and r1[0]>=-H : break
+        # Fast skip
+        # Bottom reservoir
+        if r0[0]<=-Hc and r1[0]<=-Hc and r1[0]>=-H : break
+        # Top reservoir
+        if r0[0]>=0 and r1[0]>=0 and r1[0]<=H : break
+        # Inside channel
+        if r0[0]>=-Hc and r0[0]<=0 and \
+           r1[0]>=-Hc and r1[0]<=0 : break
 
         # Intersection with top wall
         r1, doCollide = vector2D.get_reflected(r0, r1, 

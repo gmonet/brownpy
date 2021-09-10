@@ -108,7 +108,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.1.0b'
+  __version__ = '0.1.1b'
   MAX_BOUNCE = 10
 
   def __init__(self,
@@ -516,7 +516,7 @@ class Universe():
 
     max_chunk_size = min(N_steps, 100_000)  # TODO : dask ???
 
-    with h5py.File(self._output_path, 'a') as f:
+    with h5py.File(self._output_path, 'r+') as f:
       runsgrp = f['run']
 
       i_run = 0
@@ -535,7 +535,7 @@ class Universe():
       regions_ds = []
       for region in regions:
 
-        region_ds = regionsgrp.create_dataset(region['name'], dtype=np.uint16,
+        region_ds = regionsgrp.create_dataset(region['name'], dtype=np.uint32,
                                               shape=(N_steps,),
                                               chunks=(max_chunk_size,))
         region_ds.attrs['definition'] = region['def']
@@ -629,7 +629,7 @@ class Universe():
         if freq_dumps != 0:
           d_trajectory.copy_to_host(trajectory)
         # p_inside = d_p_inside.get()
-        d_p_inside.copy_to_device(p_inside)
+        d_p_inside.copy_to_host(p_inside)
         e3.record()
         if regions != []:
           cuda.synchronize()
@@ -639,6 +639,7 @@ class Universe():
       else:
         seeds = np.random.randint(
             np.iinfo(np.uint32).max, size=N_particles, dtype=np.uint32)
+        p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
 
         self.engine(pos,  # r0
                     self._step,  # t0
@@ -652,17 +653,17 @@ class Universe():
 
       # Transfert result from RAM to drive
       if regions != [] or freq_dumps != 0:
-        with h5py.File(self._output_path, 'a') as f:
+        with h5py.File(self._output_path, 'r+') as f:
           for i, region in enumerate(regions):
             region_ds = f[f'run/{i_run}/regions/{region["name"]}']
-            regions_ds[i_step:i_step +
-                       max_chunk_size] = p_inside[i, :chunk_size]
+            region_ds[i_step:i_step + max_chunk_size] = p_inside[i, :chunk_size]
+          pass
           if freq_dumps != 0:
             traj_ds = f[f'run/{i_run}/trajectory']
             i_N_dumps = math.floor(chunk_size/freq_dumps)
             traj_ds[:, :, max_dumps_per_chunk*i_chunk:max_dumps_per_chunk *
                     (i_chunk + 1)] = trajectory[:, :, :i_N_dumps]
-
+        pass
       self._step += chunk_size
       pbar.set_postfix(total=f'{prefix((i_step+chunk_size)*self.dt*1E-15)}s')
       pbar.update(chunk_size)
@@ -677,7 +678,7 @@ class Universe():
     self._pos = pos
     t1_cpu = time.perf_counter()
     dt_cpu = t1_cpu - t0_cpu
-    with h5py.File(self._output_path, 'a') as f:
+    with h5py.File(self._output_path, 'r+') as f:
       f[f'run/{i_run}/'].attrs['status'] = 'COMPLETED'
 
     self._pos = pos
@@ -719,5 +720,6 @@ if __name__ == "__main__":
   top = ElasticChannel1(L=L, h=h, R=R)
   u = Universe(N=N, top=top, D=D, dt=dt,
                output_path='simu', overwrite=True)
-  u.run(10000, target='cpu')
+  u.run(10000, target='gpu')
+  print('bla')
   # u2 = Universe.from_hdf5(u.output_path)
