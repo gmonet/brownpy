@@ -5,7 +5,6 @@ from pathlib import Path
 
 import brownpy.topology as Top
 import cpuinfo
-import numba as nb
 from brownpy.gpu_sim import Universe
 from numba import cuda
 

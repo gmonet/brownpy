@@ -160,7 +160,6 @@ class Infinite(Topology):
     Args:
       None
     """
-    regions = []
     regions = [{'name': 'left', 'def': 'x<=0'}]
     self.regions = regions
 
