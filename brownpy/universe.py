@@ -108,7 +108,7 @@ class Universe():
     attr2 (:obj:`int`, optional): Description of `attr2`.
 
   """
-  __version__ = '0.1.1b'
+  __version__ = '0.2.0b'
   MAX_BOUNCE = 10
 
   def __init__(self,

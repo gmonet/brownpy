@@ -4,7 +4,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='brownpy',
-    version='0.1.0b',
+    version='0.2.0b',
     description='Brownian motion through nanochannel',
     author='Geoffrey Monet',
     packages=find_packages(include=['channel-bm', 'channel-bm.*']),
