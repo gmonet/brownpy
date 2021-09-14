@@ -158,7 +158,11 @@ class Universe():
     self._blockspergrid = math.ceil(self._N / self._threadsperblock)
 
     # Set seed used for sampling intial position of particles
-    self._initial_seed = kwargs.get('seed', pick_seed())
+    seed = kwargs.get('seed')
+    if seed is None : self._initial_seed=pick_seed()
+    else: self._initial_seed = seed
+
+    # if self._initial_seed is NON
     np.random.seed(self._initial_seed)
 
     # Fill randomly the geometry

@@ -1400,22 +1400,22 @@ class SpeedElasticChannel1_dev(Topology):
     return fig, ax
 
 
-class TDElasticChannel(Topology):
+class TBElasticChannel(Topology):
   __version__ = '0.0.1'
   def __init__(self,
                L: dtype, H: dtype,
                Lc: dtype, Hc: dtype, Rc:dtype, 
                **kwargs) -> None:
-    """Create a new top-down channel with elastic boundary condition
+    """Create a new top-bottom channel with elastic boundary condition
 
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━   
-                 2Lc     before       ↑
+                 2Lc     top          ↑
            ←------------→             │
            ━━━━━━━━━━━━━━       ↑ Hc  │    
     ━━━━━━━━━━━━    ━━━━━━━━━━━━↓     │ 2H
                 ←--→                  │
                  Rc                   │
-                          after       ↓
+                          bottom      ↓
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━   
     ←--------------------------→
                  2L
