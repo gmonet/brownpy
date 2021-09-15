@@ -153,7 +153,7 @@ class Topology():
 
 
 class Infinite(Topology):
-  __version__ = '0.0.1'
+  __version__ = '0.0.2'
 
   def __init__(self, **kwargs) -> None:
     """Jut inifinite space without any walls
@@ -174,16 +174,6 @@ class Infinite(Topology):
 
     super().__init__()
 
-  def to_hdf5(self, geom_grp: h5py.Group):
-    super().to_hdf5(geom_grp)
-
-    Rgrp = geom_grp.create_group("reservoir")
-    Cgrp = geom_grp.create_group("pore")
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls()
-
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
     r0 = rng.uniform((-1, -1), (1, 1), size=(N, 2))
@@ -202,7 +192,7 @@ class Infinite(Topology):
 
 
 class InfiniteSlitAbsorbing(Topology):
-  __version__ = '0.0.1'
+  __version__ = '0.0.2'
 
   def __init__(self, L: dtype, h: dtype, l: float, **kwargs) -> None:
     """Inifinite slit with absorbing walls
@@ -276,18 +266,6 @@ class InfiniteSlitAbsorbing(Topology):
 
     super().__init__()
 
-  def to_hdf5(self, geom_grp: h5py.Group):
-    super().to_hdf5(geom_grp)
-
-    geom_grp.attrs['L'], geom_grp.attrs['h'] = self.L, self.h
-    geom_grp.attrs['l'] = self.l
-    geom_grp.attrs['bc'] = 'absorbing'
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(L=geom_grp.attrs['L'],
-              h=geom_grp.attrs['h'],
-              l=geom_grp.attrs['l'])
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
@@ -315,7 +293,7 @@ class InfiniteSlitAbsorbing(Topology):
 
 
 class Periodic(Topology):
-  __version__ = '0.0.1'
+  __version__ = '0.0.2'
 
   def __init__(self, L: dtype, **kwargs) -> None:
     """Jut periodic box without any walls
@@ -354,18 +332,6 @@ class Periodic(Topology):
 
     super().__init__()
 
-  def to_hdf5(self, geom_grp: h5py.Group):
-    super().to_hdf5(geom_grp)
-
-    Rgrp = geom_grp.create_group("reservoir")
-    Rgrp.attrs['L'] = self.L
-
-    Cgrp = geom_grp.create_group("pore")
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(L=geom_grp['reservoir'].attrs['L'],
-              )
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
@@ -399,7 +365,7 @@ class Periodic(Topology):
 
 
 class ElasticPore1(Topology):
-  __version__ = '0.0.3'
+  __version__ = '0.0.4'
 
   def __init__(self, Lm: dtype, L: dtype, R: dtype, **kwargs) -> None:
     """Simple elastic Pore
@@ -462,27 +428,6 @@ class ElasticPore1(Topology):
     self.compute_boundary_condition = compute_boundary_condition
 
     super().__init__()
-
-  def to_hdf5(self, geom_grp: h5py.Group):
-    super().to_hdf5(geom_grp)
-
-    Rgrp = geom_grp.create_group("reservoir")
-    Rgrp.attrs['Lm'] = self.L
-    Rgrp.attrs['L'] = self.L
-    Rgrp.attrs['bc_x'] = 'elastic'
-    Rgrp.attrs['bc_z'] = 'periodic'
-    Rgrp.attrs['bc_x_membrane'] = 'elastic'
-
-    Cgrp = geom_grp.create_group("pore")
-    Cgrp.attrs['R'] = self.R
-    Cgrp.attrs['bc'] = 'elastic'
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(Lm=geom_grp['reservoir'].attrs['Lm'],
-              L=geom_grp['reservoir'].attrs['L'],
-              R=geom_grp['pore'].attrs['R'])
-    return top
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
@@ -942,7 +887,7 @@ class ElasticChannel2(Topology):
 
 
 class AbsorbingChannel1(Topology):
-  __version__ = '0.0.4'
+  __version__ = '0.0.5'
 
   def __init__(self, L: dtype, h: dtype, R: dtype, l: float, **kwargs) -> None:
     """Create a new channel geometry with absorbing wall
@@ -1100,27 +1045,6 @@ class AbsorbingChannel1(Topology):
 
     super().__init__()
 
-  def to_hdf5(self, geom_grp: h5py.Group):
-    super().to_hdf5(geom_grp)
-
-    Rgrp = geom_grp.create_group("reservoir")
-    Rgrp.attrs['R'] = self.R
-    Rgrp.attrs['bc_x'] = 'elastic'
-    Rgrp.attrs['bc_z'] = 'periodic'
-    Rgrp.attrs['bc_x_membrane'] = 'elastic'
-
-    Cgrp = geom_grp.create_group("channel")
-    Cgrp.attrs['L'], Cgrp.attrs['h'] = self.L, self.h
-    Cgrp.attrs['l'] = self.l
-    Cgrp.attrs['bc'] = 'absorbing'
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(L=geom_grp['channel'].attrs['L'],
-              h=geom_grp['channel'].attrs['h'],
-              R=geom_grp['reservoir'].attrs['R'],
-              l=geom_grp['channel'].attrs['l'])
-
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)
 
@@ -1178,7 +1102,7 @@ class AbsorbingChannel1(Topology):
 
 
 class SpeedElasticChannel1_dev(Topology):
-  __version__ = '0.0.1'
+  __version__ = '0.0.2'
 
   def __init__(self, L: dtype, h: dtype, R: dtype, **kwargs) -> None:
     """Create a new channel geometry
@@ -1327,25 +1251,6 @@ class SpeedElasticChannel1_dev(Topology):
     self.compute_boundary_condition = compute_boundary_condition
 
     super().__init__()
-
-  def to_hdf5(self, geom_grp: h5py.Group):
-    super().to_hdf5(geom_grp)
-
-    Rgrp = geom_grp.create_group("reservoir")
-    Rgrp.attrs['R'] = self.R
-    Rgrp.attrs['bc_x'] = 'elastic'
-    Rgrp.attrs['bc_z'] = 'periodic'
-    Rgrp.attrs['bc_x_membrane'] = 'elastic'
-
-    Cgrp = geom_grp.create_group("channel")
-    Cgrp.attrs['L'], Cgrp.attrs['h'] = self.L, self.h
-    Cgrp.attrs['bc'] = 'elastic'
-
-  @classmethod
-  def from_hdf5(cls, geom_grp: h5py.Group):
-    top = cls(L=geom_grp['channel'].attrs['L'],
-              h=geom_grp['channel'].attrs['h'],
-              R=geom_grp['reservoir'].attrs['R'])
 
   def fill_geometry(self, N: uint, seed=None) -> ndarray:
     rng = np.random.default_rng(seed)

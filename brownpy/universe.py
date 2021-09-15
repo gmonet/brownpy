@@ -1,3 +1,4 @@
+from collections import defaultdict
 import math
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from numba.cuda.random import (create_xoroshiro128p_states,
                                xoroshiro128p_normal_float32)
 from tqdm.auto import tqdm
 
+from brownpy import topology as topology_module
 from brownpy.topology import Topology
 from brownpy.utils import prefix, reset_inside
 
@@ -170,7 +172,6 @@ class Universe():
 
     # Compile physical engine
     self._previous_gen_settings = {}
-    # self._compile()
 
     self._output_path = output_path
     if not kwargs.get('_outputFileProvided', False):
@@ -194,17 +195,20 @@ class Universe():
 
     with h5py.File(str(input_path), "r") as f:
       top_name = f['geometry'].attrs['name']
-      top_class = getattr(topology, top_name)
+      top_class = getattr(topology_module, top_name)
       if f.attrs['version'] != cls.__version__:
         raise DeprecationWarning('Depreciated version of h5py file')
 
       top = top_class.from_hdf5(f['geometry'])
       u = cls(top=top,
-              N=f['particles'].attrs['N'],
-              D=f['particles']['0'].attrs['D'],
-              dt=f.attrs['dt'],
+              N=int(f['particles'].attrs['N']),
+              D=float(f['particles']['0'].attrs['D']),
+              dt=float(f.attrs['dt']),
               output_path=input_path,
               _outputFileProvided=True)
+      u._pos = f['/particles/initial_pos'][...]
+      u._initial_seed = f['/particles'].attrs['initial_seed']
+      # np.random.seed(self._initial_seed) # TODO RANDOM not correctly reset (GPU problem)
     return u
 
   # region Properties
@@ -498,7 +502,7 @@ class Universe():
       regions (list, optional): list of regions from which to retrieve the number of particles.
         By default None: use the one defined in topology definition.
     """
-    # Generate engin function
+    # Generate engine function
     if target == 'auto':
       target = 'gpu' if cuda.is_available() else 'cpu'
     if regions is None:
@@ -512,6 +516,16 @@ class Universe():
     if seed is None:
       seed = pick_seed()
     np.random.seed(seed)
+
+    # Get compression option for inside dataset
+    kwargs_inside_ds = {}
+    if 'inside_compression' in kwargs:
+      kwargs_inside_ds['compression'] = kwargs['inside_compression']
+
+    # Get compression option for trajectory dataset
+    kwargs_traj_ds = {}
+    if 'trajectory_compression' in kwargs:
+      kwargs_traj_ds['compression'] = kwargs['trajectory_compression']
 
     # Cut the time axis into batch of gpu-computation in order to fill the gpu memory
     # 2GiB in default #TODO : not properly handled
@@ -541,7 +555,8 @@ class Universe():
 
         region_ds = regionsgrp.create_dataset(region['name'], dtype=np.uint32,
                                               shape=(N_steps,),
-                                              chunks=(max_chunk_size,))
+                                              chunks=(max_chunk_size,),
+                                              **kwargs_inside_ds)
         region_ds.attrs['definition'] = region['def']
         regions_ds.append(region_ds)
 
@@ -551,7 +566,8 @@ class Universe():
         max_dumps_per_chunk = math.floor(max_chunk_size/freq_dumps)
         traj_ds = rungrp.create_dataset('trajectory', dtype=self._dtype,
                                         shape=(self.N, 2, N_dumps),
-                                        chunks=(self.N, 2, max_dumps_per_chunk)
+                                        chunks=(self.N, 2, max_dumps_per_chunk),
+                                        **kwargs_traj_ds
                                         # chunks=(self.N,2,N_dumps)
                                         # ValueError: Number of elements in chunk must be < 4gb (number of elements in chunk must be < 4GB)
                                         )
@@ -605,13 +621,17 @@ class Universe():
     else:
       rng_states = np.zeros(N_particles, dtype=np.uint32)
 
-    t0_cpu = time.perf_counter()
+    # Prepare dict to store performance information
+    dic_perf = defaultdict(lambda: 0)
+
     pbar = tqdm(total=math.ceil(N_steps))
     for i_chunk, i_step in enumerate(range(0, N_steps, max_chunk_size)):
+      dic_perf['dt_cpu_full'] -= time.perf_counter()
       chunck_interval = range(0, N_steps)[i_step:i_step + max_chunk_size]
       chunk_size = chunck_interval[-1] - chunck_interval[0] + 1
-
+      
       if target == 'gpu':
+        dic_perf['dt_cpu_gpu'] -= time.perf_counter()
         e0.record()
         # Allocate device memory to store number of particle in regions
         # d_p_inside = cp.zeros((N_regions, max_chunk_size), dtype=np.uint32)
@@ -635,16 +655,20 @@ class Universe():
         # p_inside = d_p_inside.get()
         d_p_inside.copy_to_host(p_inside)
         e3.record()
-        if regions != []:
-          cuda.synchronize()
-          dt1.append(cuda.event_elapsed_time(e0, e1)*1E-3)
-          dt2.append(cuda.event_elapsed_time(e1, e2)*1E-3)
-          dt3.append(cuda.event_elapsed_time(e2, e3)*1E-3)
+        cuda.synchronize()
+        dic_perf['dt_gpu_allocate_inside'] += cuda.event_elapsed_time(e0, e1)*1E-3
+        dic_perf['dt_gpu_engine'] += cuda.event_elapsed_time(e1, e2)*1E-3
+        dic_perf['dt_gpu_transfert_to_host'] += cuda.event_elapsed_time(e2, e3)*1E-3
+        dic_perf['dt_cpu_gpu'] += time.perf_counter()
       else:
         seeds = np.random.randint(
             np.iinfo(np.uint32).max, size=N_particles, dtype=np.uint32)
-        p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
 
+        dic_perf['dt_cpu_allocate_inside'] -= time.perf_counter()
+        p_inside = np.zeros((N_regions, max_chunk_size), dtype=np.uint32)
+        dic_perf['dt_cpu_allocate_inside'] += time.perf_counter()
+
+        dic_perf['dt_cpu_engine'] -= time.perf_counter()
         self.engine(pos,  # r0
                     self._step,  # t0
                     chunk_size,  # N_steps
@@ -654,8 +678,10 @@ class Universe():
                     freq_dumps,  # freq_dumps
                     internal_states,
                     )
+        dic_perf['dt_cpu_engine'] += time.perf_counter()
 
       # Transfert result from RAM to drive
+      dic_perf['dt_cpu_ram_transfert'] -= time.perf_counter()
       if regions != [] or freq_dumps != 0:
         with h5py.File(self._output_path, 'r+') as f:
           for i, region in enumerate(regions):
@@ -668,11 +694,20 @@ class Universe():
             traj_ds[:, :, max_dumps_per_chunk*i_chunk:max_dumps_per_chunk *
                     (i_chunk + 1)] = trajectory[:, :, :i_N_dumps]
         pass
+      dic_perf['dt_cpu_ram_transfert'] += time.perf_counter()
       self._step += chunk_size
-      pbar.set_postfix(total=f'{prefix((i_step+chunk_size)*self.dt*1E-15)}s')
-      pbar.update(chunk_size)
 
+      dic_perf['dt_cpu_full'] += time.perf_counter()
+      pbar.set_postfix(total=f'{prefix((i_step+chunk_size)*self.dt*1E-15)}s - '+ \
+                             f"{prefix(dic_perf['dt_cpu_full']/(i_step+chunk_size)/N_particles)}s/dt/p")
+      pbar.update(chunk_size)
     pbar.close()
+    for key, value in dic_perf.items():
+      dic_perf[key] = value/N_steps
+    dic_perf['dt_gpu_full'] = dic_perf['dt_gpu_allocate_inside'] + \
+                              dic_perf['dt_gpu_engine'] + \
+                              dic_perf['dt_gpu_transfert_to_host']
+
     if target == 'gpu':
       d_pos.copy_to_host(pos)
       del d_trajectory, d_pos, d_p_inside
@@ -680,34 +715,33 @@ class Universe():
     del trajectory
     # Transfert final position to current position
     self._pos = pos
-    t1_cpu = time.perf_counter()
-    dt_cpu = t1_cpu - t0_cpu
     with h5py.File(self._output_path, 'r+') as f:
       f[f'run/{i_run}/'].attrs['status'] = 'COMPLETED'
 
     self._pos = pos
 
-    print(f'With {N_particles} particles')
+    log = ""
     if target == 'gpu':
-      if dt1 == []:
-        dt1, dt2, dt3 = 0, 0, 0
-      else:
-        dt1 = N_chunks*np.mean(dt1)
-        dt2 = N_chunks*np.mean(dt2)
-        dt3 = N_chunks*np.mean(dt3)
-      print(f'------------------------------------------')
-      print(f'GPU time per step and per particles:')
-      print(f'Allocation: {prefix(dt1/N_steps/N_particles)}s')
-      print(f'Engine: {prefix(dt2/N_steps/N_particles)}s')
-      print(f'Transfert to RAM: {prefix(dt3/N_steps/N_particles)}s')
-      print(f'Total: {prefix((dt1+dt2+dt3)/N_steps/N_particles)}s')
-    print(f'------------------------------------------')
-    print(f'CPU time per step and per particles:')
-    print(f'Total: {prefix(dt_cpu/N_steps/N_particles)}s')
-    print(f'------------------------------------------')
-    print(f'For a timestep of {prefix(dt*1E-15)}s')
-    print(f'To simulate the trajectory of 1 particle during 1 s, we need {prefix((dt_cpu/N_steps/N_particles)*(1E15/dt))}s')
+      log += f"------------------------------------------\n"
+      log += f"GPU timing :\n"
+      log += f"Allocation: {prefix(dic_perf['dt_gpu_allocate_inside']/N_particles)}s/dt/p\n"
+      log += f"Engine: {prefix(dic_perf['dt_gpu_engine']/N_particles)}s/dt/p\n"
+      log += f"Transfert to RAM: {prefix(dic_perf['dt_gpu_transfert_to_host']/N_particles)}s/dt/p\n"
+      log += f"Total: {prefix(dic_perf['dt_gpu_full']/N_particles)}s/dt/p\n"
+    log += f"------------------------------------------\n"
+    log += f"CPU timing:\n"
+    if target == 'cpu':
+      log += f"Allocation: {prefix(dic_perf['dt_cpu_allocate_inside']/N_particles)}s/dt/p\n"
+      log += f"Engine: {prefix(dic_perf['dt_cpu_engine']/N_particles)}s/dt/p\n"
+    log += f"Transfert to drive: {prefix(dic_perf['dt_cpu_ram_transfert']/N_particles)}s/dt/p\n"
+    log += f"Total: {prefix(dic_perf['dt_cpu_full']/N_particles)}s/dt/p\n"
+    log += f"------------------------------------------\n"
+    log += f"For a timestep of {prefix(dt*1E-15)}s\n"
+    log += f"To simulate the trajectory of 1 particle during 1 s, we need {prefix((dic_perf['dt_cpu_full']/N_particles)*(1E15/dt))}s\n"
 
+    # with h5py.File(self._output_path, 'r+') as f:
+    #   f[f'run/{i_run}/'].attrs['log'] = log
+    print(log)
 
 if __name__ == "__main__":
   from brownpy.topology import ElasticChannel1
