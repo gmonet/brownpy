@@ -136,6 +136,16 @@ class Topology():
                                  x1: dtype, z1: dtype,
                                  rng_states: array,
                                  internal_state: tuple):
+  '''
+  Args:
+      x0, z0 (float): Coordinate of the particle at step t-1.
+      x1, z1 (float): Coordinate of the particle at step t.
+      rng_states (function): Random number generator. 
+          See AbsorbingChannel1 for example.
+      internal_state (tuple): internal custom attribute for a particule. 
+        It can be the absorption time for example. 
+        See AbsorbingChannel1 for example.
+  '''
     raise NotImplementedError
 
   def check_region(self,
@@ -156,7 +166,7 @@ class Infinite(Topology):
   __version__ = '0.0.2'
 
   def __init__(self, **kwargs) -> None:
-    """Jut inifinite space without any walls
+    """Just an infinite space without any walls
     Args:
       None
     """
@@ -296,7 +306,7 @@ class Periodic(Topology):
   __version__ = '0.0.2'
 
   def __init__(self, L: dtype, **kwargs) -> None:
-    """Jut periodic box without any walls
+    """Just periodic box without any walls
 
     ┌┈┈┈┈┈┈┈┈┈┈┈┈┈┐ ↑  
     ┊             ┊ │ 
@@ -1303,7 +1313,6 @@ class SpeedElasticChannel1_dev(Topology):
     ax.set_aspect('equal')
     ax.set_aspect('equal')
     return fig, ax
-
 
 class TBElasticChannel(Topology):
   __version__ = '0.0.1'
