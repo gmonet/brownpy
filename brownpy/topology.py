@@ -136,16 +136,16 @@ class Topology():
                                  x1: dtype, z1: dtype,
                                  rng_states: array,
                                  internal_state: tuple):
-  '''
-  Args:
-      x0, z0 (float): Coordinate of the particle at step t-1.
-      x1, z1 (float): Coordinate of the particle at step t.
-      rng_states (function): Random number generator. 
+    '''
+    Args:
+        x0, z0 (float): Coordinate of the particle at step t-1.
+        x1, z1 (float): Coordinate of the particle at step t.
+        rng_states (function): Random number generator. 
+            See AbsorbingChannel1 for example.
+        internal_state (tuple): internal custom attribute for a particule. 
+          It can be the absorption time for example. 
           See AbsorbingChannel1 for example.
-      internal_state (tuple): internal custom attribute for a particule. 
-        It can be the absorption time for example. 
-        See AbsorbingChannel1 for example.
-  '''
+    '''
     raise NotImplementedError
 
   def check_region(self,
