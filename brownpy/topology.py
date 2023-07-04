@@ -18,7 +18,7 @@ dtype = float32
 # Maximum bounce during one step
 # It may happen that the elastic bounce of a particle lead it to another wall
 MAX_BOUNCE = 4
-
+get_random_uniform = None
 
 class Topology():
   def __init__(self) -> None:
@@ -75,7 +75,7 @@ class Topology():
         '''
 
       @jit(nopython=True, device=True)
-      def get_random_uniform(rng_states):
+      def _get_random_uniform(rng_states):
         pos = cuda.grid(1)
         return xoroshiro128p_uniform_float32(rng_states, pos)
 
@@ -95,7 +95,7 @@ class Topology():
         '''
 
       @jit(nopython=True)
-      def get_random_uniform(rng_states):
+      def _get_random_uniform(rng_states):
         return np.random.standard_normal()
     else:
       raise ValueError('Target argument should be cpu or gpu')
@@ -109,8 +109,9 @@ class Topology():
     exec(code_check_region, input_dict, return_dict)
 
     self.check_region = return_dict['check_region']
-
-    self.get_random_uniform = get_random_uniform
+    
+    global get_random_uniform
+    get_random_uniform = _get_random_uniform
 
     self._previous_gen_settings = gen_settings
 
@@ -234,7 +235,6 @@ class InfiniteSlitAbsorbing(Topology):
                                    x1: dtype, z1: dtype,
                                    rng_states: array,
                                    internal_state: tuple):
-      pos = cuda.grid(1)
 
       if internal_state[0] != 0:
         internal_state[0] -= 1
@@ -252,7 +252,7 @@ class InfiniteSlitAbsorbing(Topology):
           xint = t*x1 + (1-t)*x0
           zint = t*z1 + (1-t)*z0
           x1, z1 = xint, zint
-          T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
+          T = -(1/l)*math.log(1-get_random_uniform(rng_states))
           internal_state[0] = uint32(T)
 
       # Intersection with top channel
@@ -265,7 +265,7 @@ class InfiniteSlitAbsorbing(Topology):
           xint = t*x1 + (1-t)*x0
           zint = t*z1 + (1-t)*z0
           x1, z1 = xint, zint
-          T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
+          T = -(1/l)*math.log(1-get_random_uniform(rng_states))
           internal_state[0] = uint32(T)
 
       # Periodic boundary condition along x:
@@ -936,7 +936,6 @@ class AbsorbingChannel1(Topology):
                                    x1: dtype, z1: dtype,
                                    rng_states: array,
                                    internal_state: tuple):
-      pos = cuda.grid(1)
       toCheck = True
       i_BOUNCE = 0
 
@@ -996,7 +995,7 @@ class AbsorbingChannel1(Topology):
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = xint, zint+1
-                T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
+                T = -(1/l)*math.log(1-get_random_uniform(rng_states))
                 internal_state[0] = uint32(T)
                 break
 
@@ -1012,7 +1011,7 @@ class AbsorbingChannel1(Topology):
               zint = t*z1 + (1-t)*z0
               if math.fabs(xint) < L/2:
                 x1, z1 = xint, zint-1
-                T = -(1/l)*math.log(1-self.get_random_uniform(rng_states, pos))
+                T = -(1/l)*math.log(1-get_random_uniform(rng_states))
                 internal_state[0] = uint32(T)
                 break
 
